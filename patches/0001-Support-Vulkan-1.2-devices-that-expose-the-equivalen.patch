@@ -1,0 +1,298 @@
+From bb3f141ec2cdfaaea3b7483a0950c9039fc0ea3d Mon Sep 17 00:00:00 2001
+From: ediwiuwj <ediwiuwj@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 18:02:02 -0600
+Subject: [PATCH] Support Vulkan 1.2 devices that expose the equivalent
+ extensions
+
+Indium rejected every device that reported an API version below 1.3, even
+when the device implements all of the functionality Indium needs through
+extensions (e.g. Mesa's hasvk driver for Intel Haswell).
+
+- Accept Vulkan 1.2 devices that support VK_KHR_synchronization2,
+  VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2 (with
+  the corresponding features enabled).
+- On such devices, enable those extensions and chain their feature structs
+  instead of VkPhysicalDeviceVulkan13Features.
+- Resolve the functions promoted to core in 1.3 under their KHR/EXT names
+  when such a device is in use. Functions that are core since 1.2 (e.g.
+  vkWaitSemaphores) keep their core name: the loader returns a non-null
+  pointer for the suffixed name even when its extension is not enabled.
+- Include <stdexcept>, <string> and <cstdint> where they were used without
+  being included.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/iridium/iridium.hpp              |  1 +
+ private-include/indium/dynamic-vk.hpp    | 61 +++++++++++++++++
+ private-include/iridium/dynamic-llvm.hpp |  2 +
+ src/indium/device.cpp                    | 84 +++++++++++++++++++++++-
+ src/indium/dynamic-vk.cpp                |  1 +
+ 5 files changed, 147 insertions(+), 2 deletions(-)
+
+diff --git a/include/iridium/iridium.hpp b/include/iridium/iridium.hpp
+index 900d03a..0f73491 100644
+--- a/include/iridium/iridium.hpp
++++ b/include/iridium/iridium.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ 
+ #include <vector>
+ #include <unordered_map>
+diff --git a/private-include/indium/dynamic-vk.hpp b/private-include/indium/dynamic-vk.hpp
+index 4957eca..4612fad 100644
+--- a/private-include/indium/dynamic-vk.hpp
++++ b/private-include/indium/dynamic-vk.hpp
+@@ -6,6 +6,8 @@
+ #include <indium/instance.private.hpp>
+ 
+ #include <mutex>
++#include <stdexcept>
++#include <string>
+ 
+ namespace Indium {
+ 	namespace DynamicVK {
+@@ -16,6 +18,52 @@ namespace Indium {
+ 		bool init();
+ 		void finit();
+ 
++		/**
++		 * When `true`, functions that were promoted to core in Vulkan 1.3 are first looked up under their
++		 * `KHR`/`EXT` extension names and only then under their core names.
++		 *
++		 * This is set when a Vulkan 1.2 device that exposes the equivalent extensions is accepted
++		 * (see `initGlobalDeviceList`), since such devices do not provide the 1.3 core entry points.
++		 */
++		extern bool useExtensionFunctionNames;
++
++		/**
++		 * Returns the extension suffix (`KHR` or `EXT`) of the extension that provides `name` on Vulkan 1.2 devices
++		 * (see `vulkan12FallbackExtensions` in `device.cpp`), or `nullptr` if `name` was not promoted to core in 1.3
++		 * from one of those extensions.
++		 */
++		inline const char* extensionSuffixFor(const std::string& name) {
++			static const char* const khr[] = {
++				"vkQueueSubmit2",
++			};
++			static const char* const ext[] = {
++				"vkCmdSetCullMode",
++				"vkCmdSetDepthBiasEnable",
++				"vkCmdSetDepthBoundsTestEnable",
++				"vkCmdSetDepthCompareOp",
++				"vkCmdSetDepthTestEnable",
++				"vkCmdSetDepthWriteEnable",
++				"vkCmdSetFrontFace",
++				"vkCmdSetPrimitiveTopology",
++				"vkCmdSetRasterizerDiscardEnable",
++				"vkCmdSetScissorWithCount",
++				"vkCmdSetStencilOp",
++				"vkCmdSetStencilTestEnable",
++				"vkCmdSetViewportWithCount",
++			};
++			for (const auto* candidate: khr) {
++				if (name == candidate) {
++					return "KHR";
++				}
++			}
++			for (const auto* candidate: ext) {
++				if (name == candidate) {
++					return "EXT";
++				}
++			}
++			return nullptr;
++		};
++
+ 		/**
+ 		 * Eagerly resolves any and all required Vulkan functions.
+ 		 *
+@@ -34,6 +82,19 @@ namespace Indium {
+ 
+ 			bool resolve() {
+ 				std::call_once(_resolveFlag, [&]() {
++					pointer = nullptr;
++					if (useExtensionFunctionNames) {
++						// only functions promoted in 1.3 have a suffixed variant we enabled the extension for;
++						// others (e.g. `vkWaitSemaphores`, core since 1.2) must keep their core name, because the
++						// loader hands out a non-null pointer for the suffixed name even when its extension is disabled.
++						if (const char* suffix = extensionSuffixFor(name)) {
++							auto extName = std::string(name) + suffix;
++							pointer = reinterpret_cast<void*>(vkGetInstanceProcAddr(globalInstance, extName.c_str()));
++							if (pointer) {
++								return;
++							}
++						}
++					}
+ 					pointer = reinterpret_cast<void*>(vkGetInstanceProcAddr(globalInstance, name));
+ 				});
+ 				return !!pointer;
+diff --git a/private-include/iridium/dynamic-llvm.hpp b/private-include/iridium/dynamic-llvm.hpp
+index b3756ef..f8138d1 100644
+--- a/private-include/iridium/dynamic-llvm.hpp
++++ b/private-include/iridium/dynamic-llvm.hpp
+@@ -6,6 +6,8 @@
+ #include <dlfcn.h>
+ 
+ #include <mutex>
++#include <stdexcept>
++#include <string>
+ 
+ namespace Iridium {
+ 	namespace DynamicLLVM {
+diff --git a/src/indium/device.cpp b/src/indium/device.cpp
+index 322e186..159934f 100644
+--- a/src/indium/device.cpp
++++ b/src/indium/device.cpp
+@@ -22,6 +22,52 @@
+ 
+ std::vector<std::shared_ptr<Indium::PrivateDevice>> Indium::globalDeviceList;
+ 
++// extensions that stand in for the Vulkan 1.3 features Indium relies on, for devices that only support Vulkan 1.2
++static const char* const vulkan12FallbackExtensions[] = {
++	VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
++	VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
++	VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME,
++};
++
++static bool supportsVulkan12Fallback(VkPhysicalDevice device) {
++	uint32_t count = 0;
++	std::vector<VkExtensionProperties> extProps;
++
++	Indium::DynamicVK::vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr);
++	extProps.resize(count);
++	Indium::DynamicVK::vkEnumerateDeviceExtensionProperties(device, nullptr, &count, extProps.data());
++
++	for (const auto* required: vulkan12FallbackExtensions) {
++		bool found = false;
++		for (const auto& prop: extProps) {
++			if (strcmp(prop.extensionName, required) == 0) {
++				found = true;
++				break;
++			}
++		}
++		if (!found) {
++			return false;
++		}
++	}
++
++	VkPhysicalDeviceSynchronization2FeaturesKHR sync2 {};
++	VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds {};
++	VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 {};
++	VkPhysicalDeviceFeatures2 features {};
++
++	sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
++	sync2.pNext = &eds;
++	eds.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
++	eds.pNext = &eds2;
++	eds2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
++	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
++	features.pNext = &sync2;
++
++	Indium::DynamicVK::vkGetPhysicalDeviceFeatures2(device, &features);
++
++	return sync2.synchronization2 && eds.extendedDynamicState && eds2.extendedDynamicState2;
++};
++
+ void Indium::initGlobalDeviceList() {
+ 	std::vector<VkPhysicalDevice> physicalDevices;
+ 	uint32_t count = 0;
+@@ -43,11 +89,18 @@ void Indium::initGlobalDeviceList() {
+ 		VkPhysicalDeviceProperties props;
+ 		DynamicVK::vkGetPhysicalDeviceProperties(device, &props);
+ 
+-		if (VK_API_VERSION_VARIANT(props.apiVersion) != 0 || props.apiVersion < VK_API_VERSION_1_3) {
++		if (VK_API_VERSION_VARIANT(props.apiVersion) != 0 || props.apiVersion < VK_API_VERSION_1_2) {
+ 			// unsupported device
+ 			continue;
+ 		}
+ 
++		bool needsFallback = props.apiVersion < VK_API_VERSION_1_3;
++
++		if (needsFallback && !supportsVulkan12Fallback(device)) {
++			// Vulkan 1.2 device that lacks the extensions we need in place of the 1.3 features
++			continue;
++		}
++
+ 		VkPhysicalDeviceFeatures2 features {};
+ 		VkPhysicalDeviceVulkan11Features features11 {};
+ 		VkPhysicalDeviceVulkan12Features features12 {};
+@@ -71,6 +124,10 @@ void Indium::initGlobalDeviceList() {
+ 			continue;
+ 		}
+ 
++		if (needsFallback) {
++			DynamicVK::useExtensionFunctionNames = true;
++		}
++
+ 		globalDeviceList.push_back(std::make_shared<PrivateDevice>(std::move(device)));
+ 	}
+ };
+@@ -188,10 +245,15 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+ 		queueCreateInfos.push_back(createInfo);
+ 	}
+ 
++	bool needsFallback = _properties.apiVersion < VK_API_VERSION_1_3;
++
+ 	VkPhysicalDeviceFeatures2 features {};
+ 	VkPhysicalDeviceVulkan11Features features11 {};
+ 	VkPhysicalDeviceVulkan12Features features12 {};
+ 	VkPhysicalDeviceVulkan13Features features13 {};
++	VkPhysicalDeviceSynchronization2FeaturesKHR sync2 {};
++	VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds {};
++	VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2 {};
+ 
+ 	features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+ 	features.pNext = &features11;
+@@ -200,10 +262,22 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+ 	features11.pNext = &features12;
+ 
+ 	features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+-	features12.pNext = &features13;
+ 
+ 	features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+ 
++	sync2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR;
++	eds.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
++	eds2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
++
++	if (needsFallback) {
++		// Vulkan 1.2 device: the Vulkan 1.3 feature struct isn't valid here, so use the extension feature structs instead
++		features12.pNext = &sync2;
++		sync2.pNext = &eds;
++		eds.pNext = &eds2;
++	} else {
++		features12.pNext = &features13;
++	}
++
+ 	DynamicVK::vkGetPhysicalDeviceFeatures2(_physicalDevice, &features);
+ 
+ 	std::vector<VkExtensionProperties> extProps;
+@@ -214,6 +288,12 @@ Indium::PrivateDevice::PrivateDevice(VkPhysicalDevice physicalDevice):
+ 	std::vector<const char*> extensions {
+ 		// put required extensions here
+ 	};
++
++	if (needsFallback) {
++		for (const auto* required: vulkan12FallbackExtensions) {
++			extensions.push_back(required);
++		}
++	}
+ 	auto indiumFeatures = static_cast<Feature>(0);
+ 
+ 	std::vector<std::pair<const char*, Feature>> optionalExtensions {
+diff --git a/src/indium/dynamic-vk.cpp b/src/indium/dynamic-vk.cpp
+index a4677c3..61b8c9b 100644
+--- a/src/indium/dynamic-vk.cpp
++++ b/src/indium/dynamic-vk.cpp
+@@ -6,6 +6,7 @@
+ #endif
+ 
+ static void* libraryHandle = NULL;
++bool Indium::DynamicVK::useExtensionFunctionNames = false;
+ PFN_vkGetInstanceProcAddr Indium::DynamicVK::vkGetInstanceProcAddr = NULL;
+ PFN_vkCreateInstance Indium::DynamicVK::vkCreateInstance = NULL;
+ PFN_vkEnumerateInstanceLayerProperties Indium::DynamicVK::vkEnumerateInstanceLayerProperties = NULL;
+-- 
+2.55.0
+

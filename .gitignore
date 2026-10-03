@@ -1,0 +1,7 @@
+# Binarios de Apple: no redistribuir
+base/
+*.dmg
+*.chunklist
+*.metallib
+build*/
+target/
