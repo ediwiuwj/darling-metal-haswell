@@ -70,6 +70,31 @@ completa, lo que exige implementar las syscalls de la región compartida (`share
 `shared_region_map_and_slide_np`) en `darlingserver`, usar el `dyld` y la `libSystem` de Tahoe y
 reimplementar las syscalls y trampas Mach que XNU 12377 añadió respecto a Darwin 20.
 
+### Distancia medida entre Darling (Darwin 20) y XNU 12377 (macOS 26)
+
+`tools/compare_syscalls.py` compara las tablas (Darling emula las syscalls en espacio de usuario):
+
+| Interfaz | XNU 26 | Darling | Falta |
+|---|---|---|---|
+| Syscalls BSD | 455 reales | 268 | **189** (156 con número antiguo, 33 posteriores al 524) |
+| Trampas Mach | 60 reales | 52 | **9** |
+
+- **Lo Mach está cerca.** Faltan 9, entre ellas `iokit_user_client_trap`,
+  `host_create_mach_voucher_trap`, `mk_timer_arm_leeway_trap` y `task_dyld_process_info_notify_get_trap`;
+  `_exclaves_ctl_trap` y `pfz_exit` dependen de hardware o de la zona de funciones privadas de Apple.
+- **Lo BSD no.** Entre las 33 nuevas hay las que sí usan `libSystem` y `libdispatch` de Tahoe:
+  `ulock_wait2` (544), `kqueue_workloop_ctl` (530), `preadv`/`pwritev` (540-543),
+  `shared_region_map_and_slide_2_np` (536), `map_with_linking_np` (550), `mkfifoat`/`mknodat`,
+  `os_fault_with_payload` (529) y `memorystatus_available_memory` (534). Muchas de las 156 antiguas
+  (`mount`, `acct`, `quotactl`, `semsys`...) no las llaman las apps normales.
+- **La región compartida es hoy un stub**: `sys_shared_region_check_np` devuelve `-EINVAL` ("no hay
+  región compartida"). Las variantes `map_and_slide` no existen.
+- **`mldr` tiene el `dyld` fijado en el código** (`INSTALL_PREFIX/libexec/usr/lib/dyld`). Para probar el
+  `dyld` de Tahoe (Mach-O `MH_DYLINKER`, `minos 26.6`) hace falta compilar un `mldr` propio o sustituir
+  un archivo del sistema. El `dyld` de Darling es de 2023 (`dyld2`/`dyld3`).
+- Es una medida aproximada: una syscall puede resolverse por otra vía, y solo importan las que las
+  librerías de Tahoe llaman de verdad (eso aún no está medido).
+
 `tools/dyld_iterate.py` automatiza esta prueba: ejecuta un binario en Darling, extrae la librería que
 falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
 anterior.
@@ -80,6 +105,7 @@ anterior.
 |---|---|
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+| `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
 | `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
