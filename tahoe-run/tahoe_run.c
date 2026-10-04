@@ -620,7 +620,7 @@ void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num]
 static __thread char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 
 static void log_call(const char* kind, uint32_t num, const char* name, struct ctx* c, const char* verdict) {
-	logf_("  [%s] <%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
+	logf_("  [%s] <%d:%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), (int)(syscall(SYS_gettid) - getpid()), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
 }
 
 static void on_sigsys(int sig, siginfo_t* si, void* v) {
@@ -739,6 +739,10 @@ int main(int argc, char** argv, char** envp) {
 	}
 	g_argv = argv;
 	{ int f = fcntl(2, F_DUPFD_CLOEXEC, 900); if (f >= 0) logfd = f; }
+	if (getenv("TAHOE_LOGFILE")) {          // los procesos hijos escriben su registro en un archivo común
+		int f = open(getenv("TAHOE_LOGFILE"), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+		if (f >= 0) { int g = fcntl(f, F_DUPFD_CLOEXEC, 900); close(f); if (g >= 0) logfd = g; }
+	}
 	tahoe_root = getenv("TAHOE_ROOT");
 	trace_all = getenv("TAHOE_TRACE") != NULL;
 	const char *cache = argv[1], *dyld = argv[2], *exe = argv[3];
@@ -770,11 +774,12 @@ int main(int argc, char** argv, char** envp) {
 	emu_mach_init();
 	emu_proc_init();
 	emu_kqueue_init();
+	emu_fs2_init();
 	emu_port_init();
 	emu_sem_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
-		{ 396, 3 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },
+		{ 396, 3 }, { 400, 7 }, { 410, 111 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },
 	};
 	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
 	install_dispatch();

@@ -42,6 +42,7 @@ void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);
 void emu_kqueue_init(void);
+void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
 int port_exists(uint32_t name);

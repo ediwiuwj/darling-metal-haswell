@@ -214,6 +214,21 @@ static size_t mig_clock_get_time(const struct hdr* req, uint8_t* r) {
 	return n + 8;
 }
 
+// host_get_exception_ports (id 415): no hay manejadores de excepciones registrados -> 0 entradas. El stub de
+// libsystem_kernel exige una respuesta compleja con SIEMPRE 32 descriptores de puerto (los no usados, nulos):
+// cabecera(24) + nº de descriptores=32 (4) + 32*12 descriptores + NDR(8) + masksCnt=0 (los tres arrays comparten el contador): 424 bytes.
+static size_t mig_host_get_exception_ports(const struct hdr* req, uint8_t* r) {
+	size_t n = 24 + 4 + 32 * 12 + 8 + 4;
+	struct hdr h = { .bits = 0x80000000u, .size = (uint32_t)n, .id = req->id + 100 };
+	memset(r, 0, n);
+	memcpy(r, &h, sizeof h);
+	uint32_t cnt = 32;
+	memcpy(r + 24, &cnt, 4);
+	static const uint8_t ndr[8] = { 0, 0, 0, 0, 1, 0, 0, 0 };
+	memcpy(r + 28 + 32 * 12, ndr, 8);
+	return n;
+}
+
 // ---------------------------------------------------------------- mach_msg2
 // Recepción desde un puerto de usuario: saca el mensaje, ajusta la cabecera como lo hace el kernel (el puerto de
 // destino pasa a ser "local" y el de respuesta "remoto", con las disposiciones convertidas) y añade el trailer pedido.
@@ -288,6 +303,8 @@ static long mach_msg2(struct ctx* c) {
 	case 2880: n = reply_port(rep, &h, 0, 17); break;   // io_service_get_matching_service: ningún servicio IOKit
 	case 413: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_set_special_port: sin efecto
 	case 205: n = reply_port(rep, &h, alloc_port(), 17); break;  // host_get_io_main
+	case 415: n = mig_host_get_exception_ports(&h, rep); break;
+	case 414: case 416: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // set / swap exception ports: sin efecto
 	case 1000: n = mig_clock_get_time(&h, rep); break;
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
 	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto

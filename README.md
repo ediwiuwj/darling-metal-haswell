@@ -309,13 +309,15 @@ Qué se vio, por orden:
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
-3. **`launchd` como PID 1**: arranca, ejecuta su inicialización en hilos de cola de trabajo y queda en reposo, pero
-   **todavía no carga ningún demonio** (nunca abre `/System/Library/LaunchDaemons`). Hecho: hilos reales,
-   capacidades de libpthread (`0x400000df`), kqueue/kevent (`emu_kqueue.c`), semáforos Mach (`emu_sem.c`), **hilos de
-   colas de trabajo y workloops** lanzados por el emulador (`wqthread` con los registros de XNU) y **puertos Mach
-   dentro de un proceso** (`emu_port.c`: derechos de recepción con cola, conjuntos, `mach_msg2` de envío/recepción,
-   `mach_port_type`). Falta: averiguar qué espera `launchd` (desensamblar su arranque), IPC **entre procesos**
-   (los nombres de puerto son locales a cada proceso) y `EVFILT_MACHPORT` con recepción directa.
+3. **`launchd` como PID 1**: ya ejecuta su **secuencia de arranque** y lanza programas reales de macOS 26 con
+   `posix_spawn` (`init_data_protection`, `rc.temporaryDataVolume`, `rc.cdrom`, `cc_fips_test`, `BootCacheControl`),
+   que se relanzan como procesos `tahoe-run` hijos. `/sbin/mount` se sustituye por un proceso que sale con 0
+   (`TAHOE_STUB_EXEC`). Piezas nuevas: hilos de colas de trabajo con el evento de petición de workloop,
+   `host_get_exception_ports` (el stub exige 32 descriptores), `ulock` sobre futex, `posix_spawn`, llamadas de
+   archivos que modifican el árbol (`emu_fs2.c`, siempre dentro de `TAHOE_ROOT`), `sysctl` de arranque,
+   registro común de hijos con `TAHOE_LOGFILE`. Falta: que cargue `/System/Library/LaunchDaemons` y llegue a
+   `WindowServer`; IPC entre procesos (nombres de puerto locales a cada proceso); acciones de archivo de
+   `posix_spawn` (se ignoran).
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);

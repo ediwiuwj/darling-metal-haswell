@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <pthread.h>
+#include <spawn.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <stdlib.h>
@@ -299,11 +300,11 @@ static void host_path(const char* guest, char* out, size_t cap) {
 }
 
 // execve: se relanza tahoe-run con el programa nuevo. Soporta "#!" (hasta 4 niveles).
-static long bsd_execve(struct ctx* c) {
+static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn, pid_t* pidout) {
 	char gpath[4096], hpath[4200];
-	if (safe_string(c->a[0], gpath, sizeof gpath) != 0) return -D_EFAULT;
+	if (safe_string(pathp, gpath, sizeof gpath) != 0) return -D_EFAULT;
 	char **av, **ev;
-	int ac = read_strv(c->a[1], &av, 4096), ec = read_strv(c->a[2], &ev, 4096);
+	int ac = read_strv(argvp, &av, 4096), ec = read_strv(envp, &ev, 4096);
 	if (ac == 0) { av[0] = strdup(gpath); ac = 1; }
 	for (int depth = 0; depth < 4; depth++) {
 		host_path(gpath, hpath, sizeof hpath);
@@ -334,6 +335,24 @@ static long bsd_execve(struct ctx* c) {
 		}
 		break;
 	}
+	// Programas que dependen de hardware/IOKit de verdad (montaje de volúmenes, fsck...) se sustituyen por un
+	// proceso que sale con éxito. Lista configurable en TAHOE_STUB_EXEC (rutas separadas por comas).
+	{
+		const char* stubs = getenv("TAHOE_STUB_EXEC");
+		if (!stubs) stubs = "/sbin/mount";
+		size_t gl = strlen(gpath);
+		for (const char* p = stubs; *p;) {
+			const char* q = strchr(p, ',');
+			size_t l = q ? (size_t)(q - p) : strlen(p);
+			if (l == gl && !strncmp(p, gpath, l)) {
+				logf_("    exec \"%s\" sustituido por un proceso que sale con 0\n", gpath);
+				char* targv[] = { (char*)"true", NULL };
+				if (spawn) { int pe = posix_spawnp(pidout, "true", NULL, NULL, targv, environ); return pe ? -darwin_errno(pe) : 0; }
+				_exit(0);
+			}
+			p += l + (q ? 1 : 0);
+		}
+	}
 	// argv de tahoe-run: [self, caché, dyld, programa(host), argumentos del programa...]
 	char** nargv = calloc(ac + 5, sizeof(char*));
 	int k = 0;
@@ -342,16 +361,44 @@ static long bsd_execve(struct ctx* c) {
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 4, sizeof(char*));
+	char** nenv = calloc(ec + 6, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
 	if (tahoe_root) { snprintf(b1, sizeof b1, "TAHOE_ROOT=%s", tahoe_root); nenv[e++] = b1; }
 	snprintf(b2, sizeof b2, "TAHOE_ARGV0=%s", av[0]);
 	nenv[e++] = b2;
+	static char b3[4300];
+	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
+	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
+	if (spawn) {
+		int pe = posix_spawn(pidout, g_self_exe, NULL, NULL, nargv, nenv);
+		return pe ? -darwin_errno(pe) : 0;
+	}
 	execve(g_self_exe, nargv, nenv);
 	return -darwin_errno(errno);
+}
+
+static long bsd_execve(struct ctx* c) { return exec_common(c->a[0], c->a[1], c->a[2], 0, NULL); }
+
+// posix_spawn(pid*, ruta, adesc*, argv, envp): crea un proceso nuevo de tahoe-run. De momento se ignoran los
+// atributos y las acciones sobre archivos (se avisa en el registro); POSIX_SPAWN_SETEXEC se trata como execve.
+static long bsd_posix_spawn(struct ctx* c) {
+	uint64_t ad[4] = { 0 };
+	uint16_t psa_flags = 0;
+	if (c->a[2]) {
+		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
+		if (ad[1]) safe_read(ad[1], &psa_flags, 2);
+	}
+	char gp[256] = "?";
+	safe_string(c->a[1], gp, sizeof gp);
+	logf_("    posix_spawn(\"%s\") attr_flags=0x%x acciones_archivo=%lu\n", gp, psa_flags, ad[2]);
+	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
+	pid_t pid = 0;
+	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
+	if (r == 0 && c->a[0]) { uint32_t p = (uint32_t)pid; safe_write(c->a[0], &p, 4); }
+	return r;
 }
 
 // bsdthread_ctl(comando, arg1, arg2, arg3): QoS, sobrescrituras de prioridad y permisos de las colas de trabajo.
@@ -406,8 +453,8 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 #define WQ_TSD_SET    0x00200000u
 #define WQ_WORKLOOP   0x00400000u
 #define WQ_STACK      (1u << 20)
-struct wq_job { uint64_t kqid; int workloop; };
-struct wl_state { uint64_t kqid; int running, pending, watching; struct wl_state* next; };
+struct wq_job { uint64_t kqid; int workloop, has_req; uint8_t req[72]; };
+struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };
 extern int kq_workloop_fd(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int);
 static void wl_arm(uint64_t kqid);
@@ -425,14 +472,16 @@ static void* wq_main(void* p) {
 	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
 	int nev = 0;
-	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; nev = (int)kq_drain(j.kqid, events, 16); if (nev < 0) nev = 0; }
+	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
+		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev); if (d > 0) nev += (int)d; }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
 	enter_guest_thread(wqthread_fn, self - 0x3000, self, 0x203, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
 }
 
-static void wq_spawn(uint64_t kqid, int workloop) {
-	struct wq_job* j = malloc(sizeof *j);
-	*j = (struct wq_job){ kqid, workloop };
+static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
+	struct wq_job* j = calloc(1, sizeof *j);
+	j->kqid = kqid; j->workloop = workloop;
+	if (req) { j->has_req = 1; memcpy(j->req, req, 72); }
 	pthread_attr_t at; pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 1 << 20);
@@ -441,15 +490,17 @@ static void wq_spawn(uint64_t kqid, int workloop) {
 }
 
 // Petición de hilo para un workloop (EVFILT_WORKLOOP con NOTE_WL_THREAD_REQUEST). Un solo hilo por workloop a la vez.
-void wq_request_workloop(uint64_t kqid) {
+void wq_request_workloop(uint64_t kqid, const void* req) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
 	int start = !w->running;
+	memcpy(w->req, req, 72); w->has_req = 1;
+	uint8_t copy[72]; memcpy(copy, req, 72);
 	if (start) w->running = 1; else w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
-	if (start) wq_spawn(kqid, 1);
+	if (start) wq_spawn(kqid, 1, copy);
 }
 
 static void wl_finished(uint64_t kqid) {
@@ -459,7 +510,9 @@ static void wl_finished(uint64_t kqid) {
 	int again = w && w->pending;
 	if (w) { w->pending = 0; w->running = again; }
 	pthread_mutex_unlock(&wl_lock);
-	if (again) wq_spawn(kqid, 1); else wl_arm(kqid);
+	uint8_t copy[72];
+	if (w) memcpy(copy, w->req, 72);
+	if (again) wq_spawn(kqid, 1, copy); else wl_arm(kqid);
 }
 
 // Vigilante de un workloop inactivo: cuando su kqueue tiene eventos listos, lanza el hilo que los atiende.
@@ -475,7 +528,7 @@ static void* wl_watch(void* p) {
 		int go = w && !w->running;
 		if (w) { w->watching = 0; if (go) w->running = 1; }
 		pthread_mutex_unlock(&wl_lock);
-		if (go) wq_spawn(kqid, 1);
+		if (go) wq_spawn(kqid, 1, NULL);
 		break;
 	}
 	return NULL;
@@ -507,7 +560,7 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 	case 0x400: case 0x10: return 0;                                   // SETUP_DISPATCH, NEWSPISUPP
 	case 0x20: case 0x30: {                                            // REQTHREADS(n): hilos de trabajo normales
 		long n = op == 0x20 ? (long)(int)c->a[2] : 1;
-		for (long i = 0; i < n && i < 8; i++) wq_spawn(0, 0);
+		for (long i = 0; i < n && i < 8; i++) wq_spawn(0, 0, NULL);
 		return 0;
 	}
 	case 0x200: return 0;                                              // SHOULD_NARROW: no
@@ -543,7 +596,31 @@ static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return 
 // map_with_linking_np (dyld): sin soporte; dyld aplica los fixups por su cuenta cuando devuelve error.
 static long bsd_map_with_linking(struct ctx* c) { (void)c; return -D_ENOSYS; }
 
+// ulock (os_unfair_lock, dispatch_once, libpthread): ulock_wait/ulock_wake sobre futex de Linux. Con ULF_NO_ERRNO
+// (0x1000000) los errores vuelven como valor negativo en lugar de por errno; aquí se devuelven siempre como errno.
+#include <linux/futex.h>
+static long bsd_ulock_wait(struct ctx* c) {
+	uint32_t* addr = (uint32_t*)c->a[1];
+	uint32_t expect = (uint32_t)c->a[2];
+	struct timespec ts, *tp = NULL;
+	uint64_t us = (uint32_t)c->a[3];
+	if (c->a[3] != 0 && us) { ts.tv_sec = us / 1000000; ts.tv_nsec = (us % 1000000) * 1000; tp = &ts; }
+	long r = syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expect, tp, NULL, 0);
+	if (r == 0) return 0;
+	switch (errno) {
+	case EAGAIN: return 0;                       // el valor ya cambió: no hay que esperar
+	case ETIMEDOUT: return -60;                  // ETIMEDOUT de Darwin
+	case EINTR: return -4;
+	default: return -darwin_errno(errno);
+	}
+}
+static long bsd_ulock_wake(struct ctx* c) {
+	long n = syscall(SYS_futex, (uint32_t*)c->a[1], FUTEX_WAKE_PRIVATE, (c->a[0] & 0x100) ? 0x7fffffff : 1, NULL, NULL, 0);
+	return n > 0 ? 0 : -D_ENOENT;
+}
+
 void emu_proc_init(void) {
+	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake);
 	reg_bsd(550, bsd_map_with_linking);
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
@@ -556,6 +633,7 @@ void emu_proc_init(void) {
 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
 	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
 	reg_bsd(478, bsd_bsdthread_ctl);
+	reg_bsd(244, bsd_posix_spawn);
 	reg_bsd(2, bsd_fork); reg_bsd(66, bsd_fork); reg_bsd(7, bsd_wait4); reg_bsd(42, bsd_pipe);
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);
 	reg_bsd(39, bsd_getppid); reg_bsd(81, bsd_getpgrp); reg_bsd(151, bsd_getpgid); reg_bsd(82, bsd_setpgid);

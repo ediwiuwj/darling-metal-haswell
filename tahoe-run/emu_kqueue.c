@@ -15,7 +15,7 @@
 
 #include "tahoe.h"
 
-extern void wq_request_workloop(uint64_t);
+extern void wq_request_workloop(uint64_t, const void* req72);
 extern void wq_note_workloop(uint64_t);
 
 enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17 };
@@ -52,6 +52,8 @@ static int kq_for(int guest) {
 }
 
 static int workq_kq_get(void) { return kq_for(-1); }
+
+static void kev_out(int layout, uint8_t* b, const struct kev* k);
 
 static long timer_ns(const struct kev* k) {
 	uint32_t f = k->fflags;
@@ -96,14 +98,14 @@ static int apply(int kq, const struct kev* c) {
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
 		case EVFILT_WORKLOOP:
-			if (c->fflags & 1 /*NOTE_WL_THREAD_REQUEST*/) wq_request_workloop(c->ident);
+			if (c->fflags & 1 /*NOTE_WL_THREAD_REQUEST*/) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
 			break;
 		default:
 			logf_("    kevent: filtro %d (ident=0x%lx flags=0x%x fflags=0x%x data=%ld ext=%lx,%lx,%lx,%lx) registrado sin efecto\n", c->filter, c->ident, c->flags, c->fflags, (long)c->data, c->ext[0], c->ext[1], c->ext[2], c->ext[3]);
 		}
 	} else {
 		n->k.udata = c->udata;
-		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) wq_request_workloop(c->ident);
+		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
 	}
 	if (c->flags & EV_DISABLE) n->enabled = 0;
 	if (c->flags & EV_ENABLE) n->enabled = 1;
