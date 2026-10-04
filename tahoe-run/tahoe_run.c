@@ -419,7 +419,7 @@ typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
-static long bsd_exit(struct ctx* c)  { ports_cleanup(); _exit((int)c->a[0]); }
+static long bsd_exit(struct ctx* c)  { if (trace_all) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {

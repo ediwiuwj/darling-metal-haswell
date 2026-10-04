@@ -697,6 +697,7 @@ void emu_proc_init(void) {
 	reg_bsd(357, bsd_getaudit_addr);
 	reg_bsd(428, bsd_audit_session_self);
 	reg_bsd(446, bsd_proc_rlimit_control);
+	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
 	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
