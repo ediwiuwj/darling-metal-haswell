@@ -108,6 +108,26 @@ que da 456 syscalls BSD frente a las 455 reales de XNU 26.
   `os_fault_with_payload` (529), `proc_info_extended_id` (545) y `map_with_linking_np` (550, solo arm64e).
 - Que un stub esté enlazado no significa que se ejecute: es una cota superior, no una medida dinámica.
 
+### Dos mecanismos que un `mldr` para Tahoe necesita, validados en este kernel (7.2.5)
+
+1. **Interceptar `syscall` en crudo.** El `dyld` y la `libSystem` de Tahoe llaman al kernel con
+   `mov eax, 0x2000000|N; syscall`, y Darling no tiene `seccomp` ni `SIGSYS` en su cargador (funciona porque
+   las bibliotecas que carga son las suyas). `PR_SET_SYSCALL_USER_DISPATCH` redirige esas llamadas a un
+   manejador de `SIGSYS`, como hace Wine con las de Windows. `test/sud_syscall_dispatch.c` lo comprueba: una
+   syscall BSD `0x2000014` y un número inexistente llegan al manejador con `si_syscall` completo y se
+   emulan (`rax = 4242` y `-ENOSYS`). Detalle que cuesta encontrar: `rt_sigreturn` debe ejecutarse desde la
+   región exenta; con el restaurador de `libc` el proceso muere por recursión (violación de segmento).
+2. **Mapear la caché de librerías.** `tools/map_dyld_cache.py` lee los mapeos de la cabecera de cada archivo
+   de la caché (8 en total, ~1 GB, desde `0x7ff800000000`) y los mapea con `MAP_FIXED_NOREPLACE`:
+   `__TEXT` ejecutable, `__DATA` privado y escribible (copy-on-write, el archivo no cambia). Sin slide.
+
+**Lo que NO está resuelto y es lo grande**: dónde vive la emulación. Las syscalls de Darling están
+implementadas como código Mach-O dentro de su `libsystem_kernel.dylib`, y con el `dyld` y la `libSystem` de
+Tahoe esa biblioteca no se carga (la de la caché la sustituye). Hay que decidir entre (A) recompilar esa
+emulación como ELF dentro de `mldr`, (B) cargar la emulación como una imagen Mach-O adicional desde `mldr`, o
+(C) escribir una emulación nueva solo para lo que Tahoe llama. Y además `commpage` con el diseño de macOS 26,
+las 18 syscalls y 10 trampas Mach que faltan y `SkyLight`.
+
 ### Compilar Darling en un Codespace
 
 `tools/build_darling_codespace.sh` compila `mldr` (el cargador Mach-O) y `darlingserver` en un
@@ -131,6 +151,8 @@ anterior.
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
 | `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
+| `tools/map_dyld_cache.py` | Mapea la `dyld_shared_cache` en sus direcciones fijas y lo verifica |
+| `test/sud_syscall_dispatch.c` | Prueba de interceptación de syscalls de macOS con syscall user dispatch |
 | `tools/build_darling_codespace.sh` | Compila `mldr` y `darlingserver` de Darling en un Codespace |
 | `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
 | `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
