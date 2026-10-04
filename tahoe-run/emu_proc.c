@@ -21,7 +21,7 @@ static long bsd_bsdthread_register(struct ctx* c) {
 	if (trace_all) logf_("    bsdthread_register: start=0x%lx wq=0x%lx pthread_size=0x%lx\n", thread_start_fn, wqthread_fn, pthread_size);
 	// Máscara de capacidades del kernel: libpthread exige FINEPRIO|BSDTHREADCTL|SETSELF|QOS_MAINTENANCE y
 	// QOS_DEFAULT; sin ella nunca marca el kernel como compatible y aborta con "has not been initialized".
-	return 0x4000007e;   // + KEVENT (0x20) y WORKLOOP (0x40): libdispatch los exige
+	return 0x400000df;   // DISPATCHFUNC|FINEPRIO|BSDTHREADCTL|SETSELF|QOS_MAINTENANCE|KEVENT|WORKLOOP|QOS_DEFAULT
 }
 
 
@@ -394,13 +394,96 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 	return 0;
 }
 
-// Colas de trabajo: de momento solo se aceptan las operaciones de configuración (WQOPS_SETUP_DISPATCH 0x400);
-// no hay hilos de cola de trabajo gestionados por el "kernel".
+// ---------------------------------------------------------------- colas de trabajo (workqueue)
+// Sin kernel, los hilos de las colas de trabajo los lanza este emulador: cada petición (hilos de un nivel de QoS o
+// un workloop de libdispatch) crea un hilo de Linux con su propia pila y pthread_t, y entra en wqthread con los
+// mismos registros y banderas que usa XNU: rdi=pthread, rsi=puerto, rdx=pila baja, rcx=lista de eventos, r8=banderas,
+// r9=nº de eventos. El hilo termina cuando libpthread llama a workq_kernreturn para "aparcarse".
+#define WQ_PRIO_QOS   0x00004000u
+#define WQ_NEWSPI     0x00040000u
+#define WQ_KEVENT     0x00080000u
+#define WQ_TSD_SET    0x00200000u
+#define WQ_WORKLOOP   0x00400000u
+#define WQ_STACK      (1u << 20)
+struct wq_job { uint64_t kqid; int workloop; };
+struct wl_state { uint64_t kqid; int running, pending; struct wl_state* next; };
+static struct wl_state* wl_states;
+static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void* wq_main(void* p) {
+	struct wq_job j = *(struct wq_job*)p;
+	free(p);
+	size_t psize = pthread_size ? pthread_size : 0x2000;
+	uint8_t* base = mmap(NULL, WQ_STACK + psize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (base == MAP_FAILED) return NULL;
+	uint64_t self = (uint64_t)base + WQ_STACK;
+	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
+	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
+	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
+	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; }
+	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
+	enter_guest_thread(wqthread_fn, self - 0x3000, self, 0x203, (uint64_t)base, j.workloop ? events : 0, flags, 0);
+}
+
+static void wq_spawn(uint64_t kqid, int workloop) {
+	struct wq_job* j = malloc(sizeof *j);
+	*j = (struct wq_job){ kqid, workloop };
+	pthread_attr_t at; pthread_attr_init(&at);
+	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	pthread_attr_setstacksize(&at, 1 << 20);
+	pthread_t th;
+	if (pthread_create(&th, &at, wq_main, j)) free(j);
+}
+
+// Petición de hilo para un workloop (EVFILT_WORKLOOP con NOTE_WL_THREAD_REQUEST). Un solo hilo por workloop a la vez.
+void wq_request_workloop(uint64_t kqid) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
+	int start = !w->running;
+	if (start) w->running = 1; else w->pending = 1;
+	pthread_mutex_unlock(&wl_lock);
+	if (start) wq_spawn(kqid, 1);
+}
+
+static void wl_finished(uint64_t kqid) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	int again = w && w->pending;
+	if (w) { w->pending = 0; w->running = again; }
+	pthread_mutex_unlock(&wl_lock);
+	if (again) wq_spawn(kqid, 1);
+}
+
 static long bsd_workq_open(struct ctx* c) { (void)c; return 0; }
+static __thread uint64_t my_workloop;   // workloop que atiende este hilo (se aprende en el primer kevent_id)
+void wq_note_workloop(uint64_t kqid) { my_workloop = kqid; }
+extern long kq_apply_changes(int layout, uint64_t chg, long n);
+
 static long bsd_workq_kernreturn(struct ctx* c) {
-	if (trace_all) logf_("    workq_kernreturn(op=0x%lx) -> sin efecto\n", c->a[0]);
+	uint64_t op = c->a[0];
+	if (trace_all) logf_("    workq_kernreturn(op=0x%lx, 0x%lx, %ld, 0x%lx)\n", op, c->a[1], (long)c->a[2], c->a[3]);
+	switch (op) {
+	case 0x400: case 0x10: return 0;                                   // SETUP_DISPATCH, NEWSPISUPP
+	case 0x20: case 0x30: {                                            // REQTHREADS(n): hilos de trabajo normales
+		long n = op == 0x20 ? (long)(int)c->a[2] : 1;
+		for (long i = 0; i < n && i < 8; i++) wq_spawn(0, 0);
+		return 0;
+	}
+	case 0x200: return 0;                                              // SHOULD_NARROW: no
+	case 0x80: return 0;                                               // SET_EVENT_MANAGER_PRIORITY
+	case 0x100: case 0x40: case 0x04: {                                // retorno de hilo: se aparca = termina
+		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2]);
+		if (op == 0x100 && my_workloop) wl_finished(my_workloop);
+		syscall(SYS_exit, 0);
+		return 0;
+	}
+	}
 	return 0;
 }
+
 
 static long bsd_proc_rlimit_control(struct ctx* c) { (void)c; return 0; }   // límites de monitorización: sin efecto
 

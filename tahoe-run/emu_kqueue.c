@@ -15,7 +15,10 @@
 
 #include "tahoe.h"
 
-enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10 };
+extern void wq_request_workloop(uint64_t);
+extern void wq_note_workloop(uint64_t);
+
+enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17 };
 enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x10, EV_CLEAR = 0x20, EV_RECEIPT = 0x40, EV_ERROR = 0x4000 };
 #define NOTE_TRIGGER 0x01000000u
 #define NOTE_FFCTRLMASK 0xc0000000u
@@ -47,6 +50,8 @@ static int kq_for(int guest) {
 	if (workq_kq < 0) workq_kq = epoll_create1(EPOLL_CLOEXEC);
 	return workq_kq;
 }
+
+static int workq_kq_get(void) { return kq_for(-1); }
 
 static long timer_ns(const struct kev* k) {
 	uint32_t f = k->fflags;
@@ -90,11 +95,15 @@ static int apply(int kq, const struct kev* c) {
 			epoll_ctl(kq, EPOLL_CTL_ADD, n->fd, &ev);
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
+		case EVFILT_WORKLOOP:
+			if (c->fflags & 1 /*NOTE_WL_THREAD_REQUEST*/) wq_request_workloop(c->ident);
+			break;
 		default:
-			logf_("    kevent: filtro %d (ident=0x%lx) registrado sin efecto\n", c->filter, c->ident);
+			logf_("    kevent: filtro %d (ident=0x%lx flags=0x%x fflags=0x%x data=%ld ext=%lx,%lx,%lx,%lx) registrado sin efecto\n", c->filter, c->ident, c->flags, c->fflags, (long)c->data, c->ext[0], c->ext[1], c->ext[2], c->ext[3]);
 		}
 	} else {
 		n->k.udata = c->udata;
+		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) wq_request_workloop(c->ident);
 	}
 	if (c->flags & EV_DISABLE) n->enabled = 0;
 	if (c->flags & EV_ENABLE) n->enabled = 1;
@@ -193,6 +202,7 @@ static long bsd_kevent_id(struct ctx* c) {
 		if (workloops[i].kq == 0) { kq = workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = c->a[0]; break; }
 	}
 	if (kq < 0) return -D_ENOMEM;
+	wq_note_workloop(c->a[0]);
 	return do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
 }
 
@@ -200,3 +210,6 @@ void emu_kqueue_init(void) {
 	reg_bsd(375, bsd_kevent_id);
 	reg_bsd(362, bsd_kqueue); reg_bsd(363, bsd_kevent); reg_bsd(369, bsd_kevent64); reg_bsd(374, bsd_kevent_qos);
 }
+
+// Aplica una lista de cambios sin recoger eventos (retorno de hilo de workloop).
+long kq_apply_changes(int layout, uint64_t chg, long n) { return do_kevent(workq_kq_get(), layout, chg, n, 0, 0, 0); }
