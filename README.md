@@ -279,3 +279,22 @@ Los fuentes abiertos de Apple (`xnu-12377.121.6`, `dyld-1378`, `objc4-951.7`,
   licencia (MPL-2.0), no bajo la MIT de arriba.
 - [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan) es LGPL-3.0-or-later; no se incluye
   ningún código suyo, solo un SPIR-V generado con él.
+
+## Dónde retomar (estado al 4 de octubre de 2026)
+
+**Funciona**: `tahoe-run` ejecuta programas reales de macOS 26 (`ls`, `echo`, `cat`, `uname`, `pwd`, `bash` 3.2.57 con
+órdenes internas) sobre Linux, sin XNU ni Darling. Compilar con `tahoe-run/build.sh <xnu>` y ejecutar con
+`TAHOE_ROOT=<recovery extraído> ./tahoe-run <caché> <root>/usr/lib/dyld <root>/bin/ls /`.
+
+**Pendiente, por orden de utilidad**
+1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
+   Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
+2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
+3. **Probar `/sbin/launchd` como primer proceso** en un espacio de nombres de PID (`unshare --pid --fork --user`),
+   para ver con qué falla primero. Necesitará `fork` y Mach IPC con puertos reales entre procesos.
+4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
+
+**Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);
+`/proc/self/mem` en lugar de `process_vm_*`; la caché necesita *slide* v2 y región dinámica; `llvm-objdump` no
+desensambla bytes sueltos, usar `objdump -D -b binary -m i386:x86-64`; `ipsw dyld a2s` simboliza direcciones de
+la caché x86_64.
