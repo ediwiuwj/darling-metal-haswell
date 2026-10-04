@@ -49,6 +49,7 @@
 int trace_all;
 
 // ---------------------------------------------------------------- utilidades
+static int logfd = 2;   // descriptor privado del registro: el programa (p. ej. launchd) puede redirigir el 2 a /dev/null
 void logf_(const char* fmt, ...) {
 	char buf[1024];
 	va_list ap;
@@ -56,7 +57,7 @@ void logf_(const char* fmt, ...) {
 	int n = vsnprintf(buf, sizeof buf, fmt, ap);
 	va_end(ap);
 	if (n > 0) {
-		ssize_t r = write(2, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
+		ssize_t r = write(logfd, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
 		(void)r;
 	}
 }
@@ -452,6 +453,7 @@ int darwin_open_flags(int f) {
 static long bsd_open(struct ctx* c) {
 	char path[4096], full[4200];
 	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
+	if (!strcmp(path, "/dev/console")) strcpy(path, "/dev/null");        // sin consola real dentro del entorno
 	int flags = darwin_open_flags((int)c->a[1]);
 	long fd = -1;
 	if (tahoe_root && path[0] == '/') {
@@ -689,6 +691,7 @@ int main(int argc, char** argv, char** envp) {
 		return 2;
 	}
 	g_argv = argv;
+	{ int f = fcntl(2, F_DUPFD_CLOEXEC, 900); if (f >= 0) logfd = f; }
 	tahoe_root = getenv("TAHOE_ROOT");
 	trace_all = getenv("TAHOE_TRACE") != NULL;
 	const char *cache = argv[1], *dyld = argv[2], *exe = argv[3];

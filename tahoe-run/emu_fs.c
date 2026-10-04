@@ -463,6 +463,15 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 	return count;
 }
 
+
+// fsctl(ruta, comando, datos, opciones): ioctls de sistema de archivos. 0x40084a6a ('J', 106) es una consulta privada de
+// APFS del estado del dispositivo raíz que lanza launchd; devuelve 8 bytes. Se responde sin banderas.
+static long bsd_fsctl(struct ctx* c) {
+	if (c->a[1] == 0x40084a6aUL) { uint64_t z = 0; return safe_write(c->a[2], &z, 8) == 8 ? 0 : -D_EFAULT; }
+	logf_("    fsctl: comando 0x%lx sin implementar\n", c->a[1]);
+	return -45;
+}
+
 // openat: AT_FDCWD vale -2 en Darwin
 static long bsd_openat(struct ctx* c) {
 	char path[4096], full[4200];
@@ -526,7 +535,7 @@ void emu_fs_init(void) {
 	reg_bsd(24, bsd_getuid);   reg_bsd(25, bsd_geteuid);  reg_bsd(47, bsd_getgid); reg_bsd(43, bsd_getegid);
 	reg_bsd(381, bsd_mac_syscall);
 	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64);
-	reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
+	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
 	reg_bsd(41, bsd_dup);      reg_bsd(90, bsd_dup2);     reg_bsd(470, bsd_fstatat64);
 	reg_bsd(463, bsd_openat);  reg_bsd(169, bsd_csops);   reg_bsd(427, bsd_fsgetpath);
 }

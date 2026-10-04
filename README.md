@@ -280,6 +280,25 @@ Los fuentes abiertos de Apple (`xnu-12377.121.6`, `dyld-1378`, `objc4-951.7`,
 - [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan) es LGPL-3.0-or-later; no se incluye
   ningún código suyo, solo un SPIR-V generado con él.
 
+### `launchd` como PID 1 (4 de octubre de 2026)
+
+`unshare --pid --fork --user --map-root-user --mount-proc ./tahoe-run <caché> <root>/usr/lib/dyld <root>/sbin/launchd`
+ejecuta el `launchd` real de macOS 26 como **PID 1** de un espacio de nombres (el registro muestra `<1>`). Sin root.
+
+Qué se vio, por orden:
+1. `launchd` cierra la entrada, salida y error estándar y los reabre a `/dev/null`. Eso tapaba el registro de
+   `tahoe-run` (escribía en el descriptor 2): ahora usa un descriptor privado (el 900).
+2. Abre `/dev/console` (sin permiso en el espacio de nombres): se redirige a `/dev/null`.
+3. `fsctl 0x40084a6a` (consulta privada de APFS del estado del dispositivo raíz, 8 bytes): se responde con ceros.
+   Sin eso aborta con `failed to query root device status: 78` y llama a `reboot`.
+4. Lo siguiente que pide, y que ya no es trivial:
+   - **`bsdthread_create` (360)**: `launchd` crea hilos. Hace falta soporte real de hilos (con `clone`, TLS de macOS y la
+     interceptación de syscalls activa en cada hilo).
+   - **`fsctl 0xc1044a50`** (otra consulta de APFS, de entrada y salida, 260 bytes).
+   - **`mach_msg2` id 225 al host** (rutina del subsistema `host`) y, tras ellas, Mach IPC con puertos reales.
+   - `csops` operación 16 (derechos DER), la zona horaria (`/var/db/timezone/zoneinfo/posixrules`).
+   Después de esto el proceso muere con `SIGILL`.
+
 ## Dónde retomar (estado al 4 de octubre de 2026)
 
 **Funciona**: `tahoe-run` ejecuta programas reales de macOS 26 (`ls`, `echo`, `cat`, `uname`, `pwd`, `bash` 3.2.57 con
@@ -290,8 +309,8 @@ Los fuentes abiertos de Apple (`xnu-12377.121.6`, `dyld-1378`, `objc4-951.7`,
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
-3. **Probar `/sbin/launchd` como primer proceso** en un espacio de nombres de PID (`unshare --pid --fork --user`),
-   para ver con qué falla primero. Necesitará `fork` y Mach IPC con puertos reales entre procesos.
+3. **`launchd` como PID 1** (hecho el primer paso, ver arriba): siguiente, **hilos reales** (`bsdthread_create`), los
+   `fsctl` y mensajes de host que pide, y después Mach IPC con puertos reales entre procesos.
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);
