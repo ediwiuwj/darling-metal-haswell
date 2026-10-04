@@ -54,6 +54,7 @@ static long bsd_gettimeofday(struct ctx* c) {
 // shm_open/shm_unlink: objetos de memoria compartida POSIX como archivos de /dev/shm con prefijo propio y nombre saneado.
 static int shm_host_name(uint64_t addr, char* out, size_t cap) {
 	char g[256];
+	(void)port_exists(0);                       // fuerza la creación/apertura de la región compartida (fija TAHOE_PORTS_OWNER)
 	if (safe_string(addr, g, sizeof g) != 0) return -1;
 	char* o = out + snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
 	for (char* s = g; *s && o < out + cap - 1; s++) *o++ = (*s == '/') ? '_' : *s;
@@ -384,7 +385,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 8 + 8, sizeof(char*));
+	char** nenv = calloc(ec + 10 + 8, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -396,6 +397,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_PORTS")) { snprintf(b4, sizeof b4, "TAHOE_PORTS=%s", getenv("TAHOE_PORTS")); nenv[e++] = b4; }
 	if (getenv("TAHOE_PORTS_OWNER")) { snprintf(b5, sizeof b5, "TAHOE_PORTS_OWNER=%s", getenv("TAHOE_PORTS_OWNER")); nenv[e++] = b5; }
 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
+	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
@@ -607,7 +609,8 @@ static void wl_arm(uint64_t kqid) {
 
 static long bsd_workq_open(struct ctx* c) { (void)c; return 0; }
 void wq_note_workloop(uint64_t kqid) { (void)kqid; }
-extern long kq_apply_changes(int layout, uint64_t chg, long n);
+void wq_arm_workloop(uint64_t kqid) { wl_arm(kqid); }   // vigilar los eventos de este workloop aunque aún no tenga hilo
+extern long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop);
 
 static long bsd_workq_kernreturn(struct ctx* c) {
 	uint64_t op = c->a[0];
@@ -628,7 +631,7 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 			memcpy(&id, kv, 8); memcpy(&f, kv + 8, 2); memcpy(&fl, kv + 10, 2); memcpy(&ud, kv + 16, 8); memcpy(&ff, kv + 24, 4); memcpy(ext, kv + 40, 32);
 			logf_("      retorno: ident=0x%lx filter=%d flags=0x%x fflags=0x%x udata=0x%lx ext=%lx,%lx,%lx,%lx\n", id, f, fl, ff, ud, ext[0], ext[1], ext[2], ext[3]);
 		}
-		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2]);
+		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2], my_workloop);
 		if (op == 0x100 && my_workloop) wl_finished(my_workloop);
 		syscall(SYS_exit, 0);
 		return 0;
@@ -693,7 +696,8 @@ void emu_proc_init(void) {
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
 	reg_bsd(357, bsd_getaudit_addr);
 	reg_bsd(428, bsd_audit_session_self);
-	reg_bsd(446, bsd_proc_rlimit_control); reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
+	reg_bsd(446, bsd_proc_rlimit_control);
+	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
 	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
 	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto

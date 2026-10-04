@@ -9,6 +9,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/timerfd.h>
@@ -17,8 +20,9 @@
 
 extern void wq_request_workloop(uint64_t, const void* req72);
 extern void wq_note_workloop(uint64_t);
+extern void wq_arm_workloop(uint64_t);
 
-enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17 };
+enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17, EVFILT_PROC = -5 };
 static __thread uint64_t g_dout, g_davail;   // búfer de datos del kevent_qos en curso (mensajes Mach recibidos directamente)
 enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x10, EV_CLEAR = 0x20, EV_RECEIPT = 0x40, EV_ERROR = 0x4000 };
 #define NOTE_TRIGGER 0x01000000u
@@ -28,6 +32,16 @@ enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x
 #define NOTE_FFCOPY 0xc0000000u
 #define NOTE_FFLAGSMASK 0x00ffffffu
 
+static int linux_to_darwin_signal(int s) {
+	switch (s) {
+	case SIGHUP: return 1; case SIGINT: return 2; case SIGQUIT: return 3; case SIGILL: return 4; case SIGTRAP: return 5; case SIGABRT: return 6;
+	case SIGBUS: return 10; case SIGFPE: return 8; case SIGKILL: return 9; case SIGSEGV: return 11; case SIGSYS: return 12; case SIGPIPE: return 13;
+	case SIGALRM: return 14; case SIGTERM: return 15; case SIGURG: return 16; case SIGSTOP: return 17; case SIGTSTP: return 18; case SIGCONT: return 19;
+	case SIGCHLD: return 20; case SIGTTIN: return 21; case SIGTTOU: return 22; case SIGIO: return 23; case SIGXCPU: return 24; case SIGXFSZ: return 25;
+	case SIGVTALRM: return 26; case SIGPROF: return 27; case SIGWINCH: return 28; case SIGUSR1: return 30; case SIGUSR2: return 31;
+	default: return s;
+	}
+}
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
 struct knote { struct kev k; int kq, fd; int enabled; struct knote* next; };
 static struct knote* notes;
@@ -43,6 +57,7 @@ static void drop(struct knote* dead) {
 		if (*p == dead) { *p = dead->next; break; }
 	if (dead->fd >= 0 && (dead->k.filter == EVFILT_TIMER || dead->k.filter == EVFILT_USER)) close(dead->fd);
 	else if (dead->fd >= 0 && dead->k.filter == EVFILT_MACHPORT) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
+	else if (dead->fd >= 0 && dead->k.filter == EVFILT_PROC) { epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL); close(dead->fd); }
 	else if (dead->fd >= 0) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
 	free(dead);
 }
@@ -64,6 +79,24 @@ static long timer_ns(const struct kev* k) {
 	if (f & 2) return v * 1000L;           // NOTE_USECONDS
 	if (f & 4) return v;                   // NOTE_NSECONDS
 	return v * 1000000L;                   // por omisión, milisegundos
+}
+
+// Un knote deshabilitado no puede seguir en epoll (un descriptor legible lo despertaría sin parar).
+static int knote_epoll_events(const struct knote* n) {
+	switch (n->k.filter) {
+	case EVFILT_WRITE: return EPOLLOUT | ((n->k.flags & EV_CLEAR) ? EPOLLET : 0);
+	case EVFILT_READ: return EPOLLIN | ((n->k.flags & EV_CLEAR) ? EPOLLET : 0);
+	case EVFILT_MACHPORT: return EPOLLIN;
+	default: return 0;
+	}
+}
+static void knote_set_enabled(struct knote* n, int en) {
+	if (n->enabled == en) return;
+	n->enabled = en;
+	int ev = knote_epoll_events(n);
+	if (n->fd < 0 || !ev) return;
+	struct epoll_event e = { .events = (uint32_t)ev, .data.ptr = n };
+	if (en) epoll_ctl(n->kq, EPOLL_CTL_ADD, n->fd, &e); else epoll_ctl(n->kq, EPOLL_CTL_DEL, n->fd, NULL);
 }
 
 // Aplica un cambio; devuelve 0 o un errno de Darwin.
@@ -99,10 +132,20 @@ static int apply(int kq, const struct kev* c) {
 			epoll_ctl(kq, EPOLL_CTL_ADD, n->fd, &ev);
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
+		case EVFILT_PROC: {
+			// pidfd: legible cuando el proceso termina. NOTE_EXIT con el estado de espera de Darwin en data.
+			int pfd = (int)syscall(SYS_pidfd_open, (pid_t)c->ident, 0);
+			if (pfd < 0) { int e = darwin_errno(errno); drop(n); return e == D_ENOENT ? 3 /* ESRCH */ : e; }
+			n->fd = pfd;
+			ev.events = EPOLLIN;
+			epoll_ctl(kq, EPOLL_CTL_ADD, pfd, &ev);
+			break;
+		}
 		case EVFILT_MACHPORT: {
 			int pfd = port_eventfd((uint32_t)c->ident);
 			if (pfd < 0) { logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident); break; }
 			n->fd = pfd;
+			if (trace_all) logf_("    kevent: EVFILT_MACHPORT puerto=0x%lx flags=0x%x fflags=0x%x udata=0x%lx kq=%d\n", c->ident, c->flags, c->fflags, c->udata, kq);
 			ev.events = EPOLLIN;
 			epoll_ctl(kq, EPOLL_CTL_ADD, pfd, &ev);
 			break;
@@ -114,11 +157,12 @@ static int apply(int kq, const struct kev* c) {
 			logf_("    kevent: filtro %d (ident=0x%lx flags=0x%x fflags=0x%x data=%ld ext=%lx,%lx,%lx,%lx) registrado sin efecto\n", c->filter, c->ident, c->flags, c->fflags, (long)c->data, c->ext[0], c->ext[1], c->ext[2], c->ext[3]);
 		}
 	} else {
+		if (trace_all && c->filter == EVFILT_MACHPORT) logf_("    kevent: actualiza MACHPORT 0x%lx flags=0x%x fflags=0x%x (activo antes=%d)\n", c->ident, c->flags, c->fflags, n->enabled);
 		n->k.udata = c->udata;
 		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
 	}
-	if (c->flags & EV_DISABLE) n->enabled = 0;
-	if (c->flags & EV_ENABLE) n->enabled = 1;
+	if (c->flags & EV_DISABLE) knote_set_enabled(n, 0);
+	if (c->flags & EV_ENABLE) knote_set_enabled(n, 1);
 	if (c->filter == EVFILT_USER) {
 		uint32_t op = c->fflags & NOTE_FFCTRLMASK, v = c->fflags & NOTE_FFLAGSMASK;
 		if (op == NOTE_FFAND) n->k.fflags &= v; else if (op == NOTE_FFOR) n->k.fflags |= v; else if (op == NOTE_FFCOPY) n->k.fflags = v;
@@ -146,6 +190,7 @@ static void kev_out(int layout, uint8_t* b, const struct kev* k) {
 }
 
 // Núcleo común. timeout_ms: -1 = esperar, 0 = no esperar.
+static __thread int g_no_poll;   // KEVENT_FLAG_ERROR_EVENTS: solo se devuelven errores de los cambios, no eventos
 static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_t evp, long nev, int timeout_ms) {
 	int kq = kq_for(guest_kq);
 	uint8_t raw[72];
@@ -164,7 +209,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 			} else if (e) return -e;
 		}
 	}
-	if (nout >= nev) return nout;
+	if (nout >= nev || g_no_poll) return nout;
 	struct epoll_event es[32];
 	int max = (int)(nev - nout) < 32 ? (int)(nev - nout) : 32;
 	if (nout) timeout_ms = 0;
@@ -172,8 +217,10 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 	if (r < 0) return errno == EINTR ? -4 /* EINTR */ : -darwin_errno(errno);
 	for (int i = 0; i < r; i++) {
 		struct knote* n = es[i].data.ptr;
+		if (trace_all && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (activo=%d, dout=%d)\n", n->k.ident, n->enabled, g_dout != 0);
 		if (!n->enabled) continue;
 		struct kev k = n->k;
+		k.flags &= (uint16_t)~(EV_ADD | EV_ENABLE | EV_DISABLE | EV_DELETE | EV_RECEIPT | 0x200 /*EV_VANISHED*/);   // el kernel no repite las banderas de registro
 		k.data = 1;
 		if (n->k.filter == EVFILT_READ) { int avail = 0; ioctl(n->fd, FIONREAD, &avail); k.data = avail; if (es[i].events & EPOLLHUP) k.flags |= 0x8000 /*EV_EOF*/; }
 		else if (n->k.filter == EVFILT_MACHPORT) {
@@ -185,12 +232,25 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				long rr = avail ? mach_rx_message((uint32_t)n->k.ident, 0, n->k.fflags, g_dout, (uint32_t)avail, &total) : 0x10004004;
 				if (rr) { if (rr == 0x10004003) continue; k.fflags = (uint32_t)rr; }
 				else {
+					k.fflags = 0;                                  // resultado de mach_msg: éxito (no las banderas pedidas)
 					k.ext[0] = g_dout; k.ext[1] = total;
 					g_dout += (total + 15) & ~15u; avail -= (total + 15) & ~15u;
 					safe_write(g_davail, &avail, 8);
 				}
 			}
-			if (n->k.flags & 0x80 /*EV_DISPATCH*/) n->enabled = 0;
+			if (n->k.flags & 0x80 /*EV_DISPATCH*/) knote_set_enabled(n, 0);
+		}
+		else if (n->k.filter == EVFILT_PROC) {
+			siginfo_t si = { 0 };
+			int st = 0;
+			if (waitid(P_PID, (id_t)n->k.ident, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid) {
+				if (si.si_code == CLD_EXITED) st = (si.si_status & 0xff) << 8;                // WEXITSTATUS de Darwin
+				else st = linux_to_darwin_signal(si.si_status) | ((si.si_code == CLD_DUMPED) ? 0x80 : 0);
+			}
+			k.fflags = (n->k.fflags & 0x80000000u) | (n->k.fflags & 0x04000000u);              // NOTE_EXIT / NOTE_EXITSTATUS
+			k.data = (n->k.fflags & 0x04000000u) ? st : 0;
+			k.flags |= 0x8000 | EV_ONESHOT;                                                     // EV_EOF; el kernel elimina el knote y lo avisa con EV_ONESHOT
+			n->k.flags |= EV_ONESHOT;                                                           // un proceso solo sale una vez
 		}
 		else if (n->k.filter == EVFILT_TIMER || n->k.filter == EVFILT_USER) { uint64_t cnt = 0; if (read(n->fd, &cnt, 8) == 8) k.data = (int64_t)cnt; }
 		kev_out(layout, raw, &k);
@@ -210,13 +270,13 @@ static int ts_ms(uint64_t p) {
 
 static long bsd_kqueue(struct ctx* c) { (void)c; int fd = epoll_create1(0); return fd < 0 ? -darwin_errno(errno) : fd; }
 // kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
-static long bsd_kevent(struct ctx* c) { g_dout = 0; return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
+static long bsd_kevent(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
 // kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout)
-static long bsd_kevent64(struct ctx* c) { g_dout = 0; return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6))); }
+static long bsd_kevent64(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6))); }
 // kevent_qos(kq, changelist, nchanges, eventlist, nevents, data_out, data_available, flags)
 static long bsd_kevent_qos(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
-	g_dout = c->a[5]; g_davail = ctx_arg(c, 6);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
 	return do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
 }
 
@@ -232,7 +292,7 @@ int kq_workloop_fd(uint64_t id) {
 }
 // Recoge sin esperar los eventos pendientes de un workloop (kevent_qos_s de 72 bytes). Devuelve cuántos.
 long kq_drain(uint64_t id, uint64_t evp, int max, uint64_t dout, uint64_t davail) {
-	g_dout = dout; g_davail = davail;
+	g_dout = dout; g_davail = davail; g_no_poll = 0;
 	int kq = kq_workloop_fd(id);
 	return kq < 0 ? 0 : do_kevent(kq, 2, 0, 0, evp, max, 0);
 }
@@ -241,8 +301,10 @@ static long bsd_kevent_id(struct ctx* c) {
 	int kq = kq_workloop_fd(c->a[0]);
 	if (kq < 0) return -D_ENOMEM;
 	wq_note_workloop(c->a[0]);
-	g_dout = c->a[5]; g_davail = ctx_arg(c, 6);
-	return do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
+	long r = do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	wq_arm_workloop(c->a[0]);
+	return r;
 }
 
 void emu_kqueue_init(void) {
@@ -251,4 +313,4 @@ void emu_kqueue_init(void) {
 }
 
 // Aplica una lista de cambios sin recoger eventos (retorno de hilo de workloop).
-long kq_apply_changes(int layout, uint64_t chg, long n) { return do_kevent(workq_kq_get(), layout, chg, n, 0, 0, 0); }
+long kq_apply_changes(int layout, uint64_t chg, long n, uint64_t workloop) { g_no_poll = 1; return do_kevent(workloop ? kq_workloop_fd(workloop) : workq_kq_get(), layout, chg, n, 0, 0, 0); }

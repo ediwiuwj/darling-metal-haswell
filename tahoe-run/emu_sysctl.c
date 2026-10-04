@@ -123,11 +123,64 @@ static long sc_out(struct ctx* c, const void* data, size_t len) {
 	return n < len ? -D_ENOMEM : 0;
 }
 
+// kinfo_proc de Darwin (648 bytes): solo se rellenan pid, estado, nombre, ppid y propietario, desde /proc.
+#include <dirent.h>
+#include <stdlib.h>
+static int fill_kinfo(int pid, uint8_t* o) {
+	char path[64], buf[512];
+	snprintf(path, sizeof path, "/proc/%d/stat", pid);
+	FILE* f = fopen(path, "r");
+	if (!f) return -1;
+	size_t n = fread(buf, 1, sizeof buf - 1, f);
+	fclose(f);
+	buf[n] = 0;
+	char* lp = strchr(buf, '(');
+	char* rp = strrchr(buf, ')');
+	if (!lp || !rp) return -1;
+	char comm[17] = { 0 };
+	size_t cl = (size_t)(rp - lp - 1) < 16 ? (size_t)(rp - lp - 1) : 16;
+	memcpy(comm, lp + 1, cl);
+	char state; int ppid = 0, pgrp = 0, sess = 0;
+	sscanf(rp + 2, "%c %d %d %d", &state, &ppid, &pgrp, &sess);
+	memset(o, 0, 648);
+	int32_t p_flag = 0x4 /*P_CONTROLT*/; uint8_t stat = (state == 'Z') ? 5 : (state == 'T') ? 4 : (state == 'S' || state == 'D') ? 3 : 2;
+	memcpy(o + 32, &p_flag, 4); o[36] = stat; memcpy(o + 40, &pid, 4);
+	memcpy(o + 243, comm, 16);
+	uint32_t uid = getuid(), gid = getgid();
+	memcpy(o + 312 + 80, &uid, 4); memcpy(o + 312 + 84, &uid, 4); memcpy(o + 312 + 88, &gid, 4); memcpy(o + 312 + 92, &gid, 4);   // e_pcred: ruid, svuid, rgid, svgid
+	memcpy(o + 416 + 4, &uid, 4);                                                                                              // e_ucred.cr_uid
+	memcpy(o + 560, &ppid, 4); memcpy(o + 564, &pgrp, 4);
+	return 0;
+}
+
 long bsd_sysctl(struct ctx* c) {
 	int mib[16];
 	uint32_t n = (uint32_t)c->a[1];
 	if (n == 0 || n > 16 || safe_read(c->a[0], mib, n * 4) != (ssize_t)(n * 4)) return -D_EINVAL;
 
+	if (n >= 3 && mib[0] == 1 && mib[1] == 14) {         // kern.proc.*: KERN_PROC_ALL (0), KERN_PROC_PID (1)
+		uint8_t one[648];
+		if (n == 4 && mib[2] == 1) {
+			if (fill_kinfo(mib[3], one) < 0) { uint64_t z = 0; safe_write(c->a[3], &z, 8); return -3; /* ESRCH */ }
+			return sc_out(c, one, sizeof one);
+		}
+		if (mib[2] == 0 || mib[2] == 2 || mib[2] == 4) {      // ALL / PGRP / UID...: se devuelven todos los procesos del espacio de PID
+			DIR* d = opendir("/proc");
+			size_t cap = 64 * 648, used = 0;
+			uint8_t* all = malloc(cap);
+			struct dirent* de;
+			while (d && (de = readdir(d))) {
+				int pid = atoi(de->d_name);
+				if (pid <= 0 || !all) continue;
+				if (used + 648 > cap) { cap *= 2; all = realloc(all, cap); }
+				if (fill_kinfo(pid, all + used) == 0) used += 648;
+			}
+			if (d) closedir(d);
+			long r = sc_out(c, all, used);
+			free(all);
+			return r;
+		}
+	}
 	if (n == 2 && mib[0] == 0 && mib[1] == 3) {          // name2oid: nombre en newp -> identificador
 		char name[256];
 		size_t len = c->a[5] < sizeof name - 1 ? c->a[5] : sizeof name - 1;

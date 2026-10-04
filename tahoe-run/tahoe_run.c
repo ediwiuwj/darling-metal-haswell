@@ -519,6 +519,22 @@ static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
 // proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
+	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
+	if ((int)c->a[0] == 9) {                                              // PIDRUSAGE: contadores a cero
+		uint8_t z[512] = { 0 };
+		size_t n = c->a[5] < sizeof z ? c->a[5] : sizeof z;
+		return safe_write(c->a[4], z, n) == (ssize_t)n ? 0 : -D_EFAULT;
+	}
+	if ((int)c->a[0] == 2 && ((int)c->a[2] == 3 || (int)c->a[2] == 4)) {   // BSDINFO (136) / TASKINFO (96)
+		uint8_t b[136] = { 0 };
+		size_t want = (int)c->a[2] == 3 ? 136 : 96;
+		if ((int)c->a[2] == 3) {
+			uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();
+			memcpy(b + 12, &pid, 4); memcpy(b + 16, &ppid, 4); memcpy(b + 20, &uid, 4); memcpy(b + 24, &gid, 4);
+		}
+		if (c->a[5] < want) return -DARWIN_EINVAL;
+		return safe_write(c->a[4], b, want) == (ssize_t)want ? (long)want : -D_EFAULT;
+	}
 	if ((int)c->a[0] == 2 && ((int)c->a[2] == 17 || (int)c->a[2] == 18)) {   // PIDUNIQIDENTIFIERINFO / BSDINFOWITHUNIQID
 		uint8_t b[136 + 56] = { 0 };
 		uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();

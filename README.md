@@ -309,17 +309,18 @@ Qué se vio, por orden:
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
-3. **`launchd` como PID 1 — arranca de verdad**: el `launchd` de macOS 26 (BaseSystem) completa su secuencia de
-   arranque, carga unos 170 demonios de `/System/Library/LaunchDaemons` y **lanza servicios** (`xpcproxy`) con
-   `posix_spawn`. Se ve en su propio registro (`<datos>/private/var/log/com.apple.xpc.launchd/launchd.log`:
-   "BaseSystem environment starting", "entering bootstrap mode", "xpcproxy spawned with pid N"). Lo que hizo
-   falta: puertos Mach **compartidos entre procesos** (región en `/dev/shm`, nombres globales, `mach_msg2` con
-   OOL, recepción directa en `EVFILT_MACHPORT`), workloops de libdispatch (petición de hilo con validación
-   `ADDR/MASK/VALUE` como el kernel), `mk_timer`, `ulock` (con `ULF_NO_ERRNO`), un puerto de hilo único por hilo
-   (`os_unfair_lock` lo usa de dueño), `getattrlist` general, sockets Unix/INET con traducción de `sockaddr`,
-   `mkdir/rename/unlink...` dentro de `TAHOE_ROOT`, `shm_open`, `coalition`, y `/proc/thread-self` (el hilo
-   principal de `launchd` termina y `/proc/self/fd` deja de existir). Falta: que los servicios arranquen sin
-   caer (cada `xpcproxy` aborta aún), IOKit, y 3 plists vacíos por la extracción con 7z (hace falta `hfsfuse`).
+3. **`launchd` como PID 1 — arranca y sus demonios corren**: el `launchd` de macOS 26 (BaseSystem) completa su arranque,
+   carga ~170 LaunchDaemons y lanza servicios con `posix_spawn` → `xpcproxy` → `execve`: **unos 30 demonios reales de
+   macOS 26 quedan en ejecución** como procesos Linux (`syslogd`, `securityd`, `opendirectoryd`, `bluetoothd`,
+   `sandboxd`, `diskarbitrationd`, `recoveryosd`, `amfid`...). Su registro: `<datos>/private/var/log/com.apple.xpc.launchd/
+   launchd.log` (y `TAHOE_FD2LOG`/`TAHOE_LOGFILE` + el socket `/var/run/syslog` falso para ver sus mensajes de error).
+   Lo que lo hizo posible: IPC Mach **entre procesos** (región compartida en `/dev/shm`, nombres globales, OOL,
+   RCV_LARGE, conversión de disposiciones, trailer con el pid del emisor, recepción directa en `EVFILT_MACHPORT`),
+   workloops de libdispatch (petición de hilo validada por `ADDR/MASK/VALUE`, vigilantes por kqueue), `EVFILT_PROC`
+   con `pidfd`, `mk_timer`, `ulock`, nombres de puerto únicos por hilo, sockets, `getattrlist`, `sysctl kern.proc`,
+   vouchers, `mach_ports_lookup3`, etc. Pendiente: 6 servicios acaban con `exit(78)`, IOKit (ids MIG 2800-2899 →
+   `kIOReturnNotFound`), 3 plists vacíos por la extracción con 7z (hace falta `hfsfuse`), señales reales y
+   `EVFILT_SIGNAL`, y la parte gráfica (`WindowServer`, `SkyLight`, Metal).
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);

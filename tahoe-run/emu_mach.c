@@ -263,8 +263,17 @@ static uint32_t rx_disp(uint32_t tx) {
 // Recibe un mensaje de `rcv_name` en `buf` (capacidad `cap`) con el trailer que piden las opciones (bits 24-27).
 // Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
-	uint8_t* m; uint32_t size;
-	int r = port_receive(rcv_name, timeout_ms, &m, &size);
+	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
+	uint8_t* m; uint32_t size, snd[3] = { 0, 0, 0 };
+	int large = (options & 0x4) != 0;                         // MACH_RCV_LARGE
+	int r = port_receive(rcv_name, timeout_ms, &m, &size, snd, cap > tsize ? cap - tsize : 1, large);
+	if (r == 0x10004004 && large) {                           // el mensaje sigue en la cola; el receptor lee el tamaño de la cabecera
+		struct hdr hh; memcpy(&hh, m, sizeof hh);
+		safe_write(buf, m, sizeof hh < size ? sizeof hh : size);
+		if (trace_all) logf_("    mach_msg: 0x%x demasiado grande (%u bytes, cabía %u): RCV_LARGE\n", rcv_name, size, cap);
+		free(m);
+		return r;
+	}
 	if (r) return r;
 	struct hdr h;
 	memcpy(&h, m, sizeof h);
@@ -273,15 +282,28 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	uint32_t remote = h.local, local = h.remote;
 	h.bits = nb; h.remote = remote; h.local = local;
 	memcpy(m, &h, sizeof h);
-	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
+	if (size >= 28 && (m[3] & 0x80)) {                        // complejo: el receptor ve los derechos de los descriptores ya convertidos
+		uint32_t dc, off = 28;
+		memcpy(&dc, m + 24, 4);
+		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
+			uint8_t type = m[off + 11];
+			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
+			off += (type == 0) ? 12 : 16;
+		}
+	}
 	uint8_t tr[68] = { 0 };
-	uint32_t seq = 0, uid = geteuid(), gid = getegid(), at[8] = { (uint32_t)-1, geteuid(), getegid(), getuid(), getgid(), (uint32_t)getpid(), 0, 1 };
+	uint32_t seq = 0, uid = snd[1], gid = snd[2], at[8] = { (uint32_t)-1, snd[1], snd[2], snd[1], snd[2], snd[0], 0, 1 };
 	memcpy(tr + 4, &tsize, 4);
 	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
 	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
 	if (tsize >= 52) memcpy(tr + 20, at, 32);
 	long res = 0;
-	if (size + tsize > cap) res = 0x10004004;                               // MACH_RCV_TOO_LARGE
+	if (size + tsize > cap) {                                 // sin RCV_LARGE: se entrega truncado y se descarta el resto
+		uint32_t fit = cap > 24 ? cap - 24 : 0;
+		safe_write(buf, m, cap < size ? cap : size);
+		(void)fit;
+		res = 0x10004004;
+	}
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = 0x10004003;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
@@ -325,14 +347,16 @@ static long mach_msg2(struct ctx* c) {
 	}
 	size_t n;
 	switch (h.id) {
+	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
+	case 222: n = reply_port(rep, &h, alloc_port(), 17); break;   // host_create_mach_voucher: puerto de voucher ficticio
 	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto
 	case 2880: n = reply_port(rep, &h, 0, 17); break;   // io_service_get_matching_service: ningún servicio IOKit
 	case 413: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_set_special_port: sin efecto
 	case 205: n = reply_port(rep, &h, alloc_port(), 17); break;  // host_get_io_main
-	case 412: n = reply_port(rep, &h, 0, 17); break;               // host_get_special_port: puerto nulo
+	case 412: n = reply_begin(rep, &h, KERN_INVALID_ARG); break;   // host_get_special_port: sin puertos privilegiados (libdispatch usa mach_host_self)
 	case 415: n = mig_host_get_exception_ports(&h, rep); break;
 	case 414: case 416: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // set / swap exception ports: sin efecto
 	case 1000: n = mig_clock_get_time(&h, rep); break;
