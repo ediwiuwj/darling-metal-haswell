@@ -24,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/personality.h>
 #include <sys/prctl.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -32,6 +33,7 @@
 #include <unistd.h>
 
 #include "sysnames.h"
+#include "tahoe.h"
 
 #ifndef SYS_USER_DISPATCH
 #define SYS_USER_DISPATCH 2
@@ -40,17 +42,14 @@
 #define MAP_FIXED_NOREPLACE 0x100000
 #endif
 
-#define CACHE_BASE   0x00007ff800000000UL
 #define COMMPAGE     0x00007fffffe00000UL
 #define DYLD_SLIDE   0x00007ffc00000000UL
-#define STACK_TOP    0x00007ff7bff00000UL
 #define STACK_SIZE   (8UL << 20)
-#define PAGE         4096UL
 
-static int trace_all;
+int trace_all;
 
 // ---------------------------------------------------------------- utilidades
-static void logf_(const char* fmt, ...) {
+void logf_(const char* fmt, ...) {
 	char buf[1024];
 	va_list ap;
 	va_start(ap, fmt);
@@ -64,10 +63,9 @@ static void logf_(const char* fmt, ...) {
 #define LOG(...) logf_("tahoe-run: " __VA_ARGS__)
 #define DIE(...) do { LOG(__VA_ARGS__); logf_("\n"); _exit(111); } while (0)
 
-static uint64_t round_up(uint64_t v) { return (v + PAGE - 1) & ~(PAGE - 1); }
 
 // ---------------------------------------------------------------- errno de Linux -> Darwin
-static int darwin_errno(int e) {
+int darwin_errno(int e) {
 	if (e >= 1 && e <= 34 && e != EAGAIN) return e;  // coinciden hasta ERANGE, salvo EAGAIN
 	switch (e) {
 	case EAGAIN: return 35;        case EINPROGRESS: return 36;   case EALREADY: return 37;
@@ -91,11 +89,36 @@ enum { DARWIN_ENOSYS = 78, DARWIN_EINVAL = 22, DARWIN_EBADF = 9, DARWIN_ENOENT =
 
 // ---------------------------------------------------------------- lectura segura de la memoria del programa
 // Un puntero erróneo del programa no debe tumbar al lanzador: se copia con process_vm_readv.
-static ssize_t safe_read(uint64_t addr, void* buf, size_t len) {
-	struct iovec l = { buf, len }, r = { (void*)addr, len };
-	return syscall(SYS_process_vm_readv, getpid(), &l, 1, &r, 1, 0);
+// El acceso a la memoria del programa va por /proc/self/mem: devuelve un error limpio si la dirección no
+// existe. (process_vm_readv/writev sobre el propio proceso fallaba con EINVAL dentro del manejador.)
+// El descriptor se reserva en un número alto para no desplazar los descriptores que ve el programa.
+static int memfd = -1;
+static void memfd_init(void) {
+	int fd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+	if (fd < 0) DIE("no puedo abrir /proc/self/mem: %s", strerror(errno));
+	memfd = fcntl(fd, F_DUPFD_CLOEXEC, 1000);
+	close(fd);
+	if (memfd < 0) DIE("no puedo reservar el descriptor de /proc/self/mem: %s", strerror(errno));
 }
-static int safe_string(uint64_t addr, char* out, size_t max) {
+ssize_t safe_read(uint64_t addr, void* buf, size_t len) {
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = pread(memfd, (char*)buf + done, len - done, (off_t)(addr + done));
+		if (n <= 0) return done ? (ssize_t)done : -1;
+		done += n;
+	}
+	return (ssize_t)done;
+}
+ssize_t safe_write(uint64_t addr, const void* buf, size_t len) {
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = pwrite(memfd, (const char*)buf + done, len - done, (off_t)(addr + done));
+		if (n <= 0) return done ? (ssize_t)done : -1;
+		done += n;
+	}
+	return (ssize_t)done;
+}
+int safe_string(uint64_t addr, char* out, size_t max) {
 	if (!addr) { out[0] = 0; return -1; }
 	size_t n = 0;
 	while (n + 1 < max) {
@@ -107,7 +130,9 @@ static int safe_string(uint64_t addr, char* out, size_t max) {
 	out[n] = 0;
 	return 0;
 }
-static const char* tahoe_root;   // TAHOE_ROOT: raíz del sistema de archivos de macOS 26 (el recovery extraído)
+const char* tahoe_root;
+char cache_guest_path[1024];
+uint64_t cache_ino;   // TAHOE_ROOT: raíz del sistema de archivos de macOS 26 (el recovery extraído)
 
 static void strlcpy_(char* d, const char* s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; if (n) d[i] = 0; }
 
@@ -208,6 +233,12 @@ static void map_dynamic_region(const char* main_path) {
 	if (!off || !maxsize) return;
 	uint8_t* p = mmap((void*)(CACHE_BASE + off), maxsize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 	if (p == MAP_FAILED) DIE("región dinámica en 0x%lx: %s", CACHE_BASE + off, strerror(errno));
+	cache_ino = st.st_ino;
+	{
+		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+		const char* g = (rl && !strncmp(main_path, tahoe_root, rl) && main_path[rl] == '/') ? main_path + rl : main_path;
+		strlcpy_(cache_guest_path, g, sizeof cache_guest_path);
+	}
 	memcpy(p, "dyld_data    v3", 16);
 	*(uint64_t*)(p + 16) = (uint64_t)st.st_dev;                   // fsid
 	*(uint64_t*)(p + 24) = (uint64_t)st.st_ino;                   // fsobjid
@@ -339,25 +370,33 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 }
 
 // ---------------------------------------------------------------- pila inicial
+static uint64_t rnd64(void) { uint64_t v = 0; while (!v) { if (getrandom(&v, sizeof v, 0) != sizeof v) v = 0x9e3779b97f4a7c15UL; } return v; }
+
 static uint64_t build_stack(uint64_t exe_mh, int argc, char** argv, char** envp, const char* exe_path) {
 	uint8_t* lo = mmap((void*)(STACK_TOP - STACK_SIZE), STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 	if (lo == MAP_FAILED) DIE("no puedo mapear la pila: %s", strerror(errno));
-	char apple[2][1100];
+	// Parámetros "apple" que XNU pone al final de la pila y que libpthread, libc y dyld leen al arrancar.
+	// ptr_munge, stack_guard y malloc_entropy son semillas aleatorias; el protector de pila lleva el byte bajo a cero.
+	enum { NAPPLE = 5 };
+	char apple[NAPPLE][1100];
 	snprintf(apple[0], sizeof apple[0], "executable_path=%s", exe_path);
 	snprintf(apple[1], sizeof apple[1], "main_stack=0x%lx,0x%lx,0x%lx,0x%lx", STACK_TOP, STACK_SIZE, STACK_TOP - STACK_SIZE, STACK_SIZE);
+	snprintf(apple[2], sizeof apple[2], "ptr_munge=0x%lx", rnd64());
+	snprintf(apple[3], sizeof apple[3], "stack_guard=0x%lx", rnd64() & ~0xffUL);
+	snprintf(apple[4], sizeof apple[4], "malloc_entropy=0x%lx,0x%lx", rnd64(), rnd64());
 	int nenv = 0;
 	while (envp[nenv]) nenv++;
 	// copiar las cadenas al final de la pila
 	uint64_t sp = STACK_TOP - 64;
 	char** av = calloc(argc + 1, sizeof(char*));
 	char** ev = calloc(nenv + 1, sizeof(char*));
-	char* ap[2];
-	for (int i = 1; i >= 0; i--) { sp -= strlen(apple[i]) + 1; memcpy((void*)sp, apple[i], strlen(apple[i]) + 1); ap[i] = (char*)sp; }
+	char* ap[NAPPLE];
+	for (int i = NAPPLE - 1; i >= 0; i--) { sp -= strlen(apple[i]) + 1; memcpy((void*)sp, apple[i], strlen(apple[i]) + 1); ap[i] = (char*)sp; }
 	for (int i = nenv - 1; i >= 0; i--) { sp -= strlen(envp[i]) + 1; memcpy((void*)sp, envp[i], strlen(envp[i]) + 1); ev[i] = (char*)sp; }
 	for (int i = argc - 1; i >= 0; i--) { sp -= strlen(argv[i]) + 1; memcpy((void*)sp, argv[i], strlen(argv[i]) + 1); av[i] = (char*)sp; }
 	sp &= ~15UL;
 	// [mh][argc][argv...][0][envp...][0][apple...][0]
-	size_t words = 1 + 1 + argc + 1 + nenv + 1 + 2 + 1;
+	size_t words = 1 + 1 + argc + 1 + nenv + 1 + NAPPLE + 1;
 	sp -= words * 8;
 	sp &= ~15UL;
 	uint64_t* w = (uint64_t*)sp;
@@ -368,15 +407,13 @@ static uint64_t build_stack(uint64_t exe_mh, int argc, char** argv, char** envp,
 	w[k++] = 0;
 	for (int i = 0; i < nenv; i++) w[k++] = (uint64_t)ev[i];
 	w[k++] = 0;
-	w[k++] = (uint64_t)ap[0];
-	w[k++] = (uint64_t)ap[1];
+	for (int i = 0; i < NAPPLE; i++) w[k++] = (uint64_t)ap[i];
 	w[k++] = 0;
 	return sp;
 }
 
 // ---------------------------------------------------------------- emulación de syscalls
-struct ctx { uint64_t nr, a[6]; ucontext_t* uc; };
-typedef long (*bsd_fn)(struct ctx*);
+typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 static long bsd_exit(struct ctx* c)  { _exit((int)c->a[0]); }
@@ -395,7 +432,7 @@ static long bsd_close(struct ctx* c) {
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 // flags de open de Darwin -> Linux
-static int darwin_open_flags(int f) {
+int darwin_open_flags(int f) {
 	int o = f & 3;                                   // O_RDONLY/O_WRONLY/O_RDWR coinciden
 	if (f & 0x0004) o |= O_NONBLOCK;
 	if (f & 0x0008) o |= O_APPEND;
@@ -439,7 +476,7 @@ static long bsd_sigprocmask(struct ctx* c) {
 		else if (c->a[0] == 3) virtual_sigmask = set;       // SIG_SETMASK
 		else return -22;
 	}
-	if (c->a[2]) { if (syscall(SYS_process_vm_writev, getpid(), &(struct iovec){ &old, 4 }, 1, &(struct iovec){ (void*)c->a[2], 4 }, 1, 0) != 4) return -14; }
+	if (c->a[2] && safe_write(c->a[2], &old, 4) != 4) return -14;
 	return 0;
 }
 static void show_payload(const char* what, uint64_t ns, uint64_t code, uint64_t payload, uint64_t size, uint64_t reason) {
@@ -470,8 +507,8 @@ static long bsd_proc_info(struct ctx* c) {
 static long bsd_thread_selfid(struct ctx* c) { (void)c; return syscall(SYS_gettid); }
 static long bsd_shared_region_check_np(struct ctx* c) {
 	// la caché ya está mapeada en su dirección preferida: devolvemos dónde empieza
-	*(uint64_t*)c->a[0] = CACHE_BASE;
-	return 0;
+	uint64_t base = CACHE_BASE;
+	return safe_write(c->a[0], &base, 8) == 8 ? 0 : -14;      // EFAULT si el puntero no es válido
 }
 
 static bsd_fn bsd_table[BSD_NAMES_N] = {
@@ -489,7 +526,7 @@ static bsd_fn bsd_table[BSD_NAMES_N] = {
 static uint32_t next_port = 0x1103;
 enum { KERN_SUCCESS_ = 0, KERN_FAILURE_ = 5 };
 
-typedef long (*mach_fn)(struct ctx*);
+typedef emu_fn mach_fn;
 static long mach_task_self_trap(struct ctx* c)   { (void)c; return PORT_TASK_SELF; }
 static long mach_thread_self_trap(struct ctx* c) { (void)c; return PORT_THREAD_SELF; }
 static long mach_host_self_trap(struct ctx* c)   { (void)c; return PORT_HOST_SELF; }
@@ -500,10 +537,7 @@ static long mach_vm_protect_trap(struct ctx* c) {
 	return mprotect((void*)c->a[1], round_up(c->a[2]), (int)c->a[4] & 7) == 0 ? KERN_SUCCESS_ : 2 /*KERN_PROTECTION_FAILURE*/;
 }
 // escritura segura de un valor de 64 bits en la memoria del programa
-static int safe_write64(uint64_t addr, uint64_t v) {
-	struct iovec l = { &v, 8 }, r = { (void*)addr, 8 };
-	return syscall(SYS_process_vm_writev, getpid(), &l, 1, &r, 1, 0) == 8 ? 0 : -1;
-}
+static int safe_write64(uint64_t addr, uint64_t v) { return safe_write(addr, &v, 8) == 8 ? 0 : -1; }
 enum { KERN_INVALID_ADDRESS_ = 1, KERN_NO_SPACE_ = 3, KERN_INVALID_ARGUMENT_ = 4 };
 #define VM_FLAGS_ANYWHERE  0x0001
 #define VM_FLAGS_OVERWRITE 0x4000
@@ -540,8 +574,7 @@ static long mach_vm_deallocate_trap(struct ctx* c) { return munmap((void*)c->a[1
 static long mach_nop_success(struct ctx* c)        { (void)c; return KERN_SUCCESS_; }
 static long mach_timebase_info_trap(struct ctx* c) {
 	uint32_t tb[2] = { 1, 1 };                         // el contador ya está en nanosegundos
-	struct iovec l = { tb, 8 }, r = { (void*)c->a[0], 8 };
-	return syscall(SYS_process_vm_writev, getpid(), &l, 1, &r, 1, 0) == 8 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
+	return safe_write(c->a[0], tb, 8) == 8 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
 }
 static mach_fn mach_table[MACH_NAMES_N] = {
 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
@@ -550,6 +583,17 @@ static mach_fn mach_table[MACH_NAMES_N] = {
 	[14] = mach_vm_protect_trap,
 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
 };
+
+// Los argumentos 7 y 8 de una syscall van en la pila del programa: [rsp] es la dirección de retorno.
+uint64_t ctx_arg(struct ctx* c, int i) {
+	if (i < 6) return c->a[i];
+	uint64_t v = 0;
+	safe_read((uint64_t)c->uc->uc_mcontext.gregs[REG_RSP] + 8 * (i - 5), &v, 8);
+	return v;
+}
+
+void reg_bsd(unsigned num, emu_fn fn)  { if (num < BSD_NAMES_N) bsd_table[num] = fn; }
+void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num] = fn; }
 
 static char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 
@@ -649,7 +693,21 @@ int main(int argc, char** argv, char** envp) {
 	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
 	char real[4096];
 	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
-	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, real);
+	// el programa debe ver su ruta como macOS (/bin/ls), no la del host
+	const char* guest = real;
+	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+	if (rl && !strncmp(real, tahoe_root, rl) && real[rl] == '/') guest = real + rl;
+	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, guest);
+	memfd_init();
+	emu_sysctl_init();
+	emu_fs_init();
+	emu_mach_init();
+	emu_proc_init();
+	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
+	static const struct { unsigned nocancel, normal; } alias[] = {
+		{ 396, 3 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },
+	};
+	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
 	install_dispatch();
 	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
 	enter(di.entry, sp);

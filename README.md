@@ -128,21 +128,41 @@ emulación como ELF dentro de `mldr`, (B) cargar la emulación como una imagen M
 (C) escribir una emulación nueva solo para lo que Tahoe llama. Y además `commpage` con el diseño de macOS 26,
 las 18 syscalls y 10 trampas Mach que faltan y `SkyLight`.
 
-### `tahoe-run`: un lanzador propio que ejecuta el `dyld` de macOS 26 sobre Linux
+### `tahoe-run`: programas reales de macOS 26 ejecutándose sobre Linux
 
 Código propio en C (`tahoe-run/`), sin código de Darling. Hace de "kernel" para un programa de Tahoe:
 mapea la caché de librerías (con el *slide* v2 aplicado y la región dinámica), fabrica el `commpage`,
 carga el `dyld` y el programa, monta la pila `[mh][argc][argv][envp][apple]` e intercepta las syscalls con
-`PR_SET_SYSCALL_USER_DISPATCH`. Cada syscall que falta se registra con su nombre.
+`PR_SET_SYSCALL_USER_DISPATCH`. Las syscalls BSD, las trampas Mach y los mensajes `mach_msg2` al kernel se
+emulan en módulos (`emu_fs.c`, `emu_sysctl.c`, `emu_mach.c`, `emu_proc.c`); todo lo que falta se registra
+con su nombre.
 
-Resultado con `ls` de macOS 26 (4 de octubre de 2026):
-- El `dyld` auténtico de Tahoe arranca, encuentra la caché y **se desmapea para seguir desde la copia
-  de la caché**; después ejecuta el inicializador de `libSystem`. Es la prueba de que el diseño funciona.
-- Errores míos que costaron encontrar: un `jmp *%r14` justo después de poner `r14` a cero; no crear la
-  región dinámica de la caché (`dyld_data    v3`, que en macOS construye `launchd`); y no aplicar el
-  *slide* de los punteros de datos (aparecían como `0x400003a93d0` en vez de direcciones reales).
-- Siguiente capa: `sysctl` (`kern.bootargs`...), `__mac_syscall`, `fcntl` y `mach_msg2` (trampa 47) hacia el
-  puerto de la tarea. Esa última es la entrada de toda la emulación de Mach IPC.
+**Resultado (4 de octubre de 2026): el `ls` de macOS 26 lista la raíz del recovery sobre Linux y sale con
+código 0.** Es el binario auténtico de Apple con su `dyld`, su `libSystem`, `libpthread` y `libobjc`
+sacados de la `dyld_shared_cache`, sin XNU ni Darling:
+
+```
+$ TAHOE_ROOT=<recovery extraído> ./tahoe-run <cache> <root>/usr/lib/dyld <root>/bin/ls /
+Applications  Install macOS Tahoe.app  Library  System  Users  Volumes  [HFS+ Private Data]  bin  cores  dev ...
+```
+
+Qué hizo falta, por orden (cada paso lo señaló el registro de syscalls o un fallo):
+`sysctl` (incluido `kern.bootargs`), `__mac_syscall`, `csops`, `openat`/`fstatat`/`dup`, `getattrlist` (volumen
+y ruta completa), `fsgetpath`, `mach_vm_map`/`host_info`/`host_get_clock_service`/`semaphore_create`/
+`task_info`/`task_get_special_port` por `mach_msg2`, `bsdthread_register`, `getdirentries64` y
+`getattrlistbulk`, además de los parámetros `ptr_munge`, `stack_guard` y `malloc_entropy` en la pila.
+
+Errores propios que costaron encontrar, por si ayudan a otros:
+- `jmp *%r14` justo después de poner `r14` a cero al saltar a `dyld`.
+- No crear la región dinámica de la caché (`dyld_data    v3`, que en macOS construye `launchd`) ni aplicar
+  el *slide* de los punteros de datos (aparecían como `0x400003a93d0`).
+- `process_vm_readv/writev` sobre el propio proceso fallaba con `EINVAL` dentro del manejador de `SIGSYS`:
+  se sustituyó por `/proc/self/mem`.
+- Constantes de `getattrlist` mal copiadas (`0x08000000` es `FULLPATH`, no los flags de protección).
+- `libpthread` aborta con `BUG IN LIBPTHREAD: Token from the kernel is 0` si falta `ptr_munge=`.
+
+Siguiente: más programas (`cat`, `echo`, `uname`...), señales, hilos reales y `launchd`/Mach IPC con puertos de
+verdad; después, la parte gráfica (`SkyLight`, `QuartzCore`), que es la que llevaría al recovery.
 
 ### Compilar Darling en un Codespace
 
