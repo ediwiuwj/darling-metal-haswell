@@ -3,18 +3,25 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <pthread.h>
+#include <sys/mman.h>
+#include <stdlib.h>
 #include "tahoe.h"
 
 // bsdthread_register(thread_start, wqthread, pthread_size, ...): libpthread registra aquí las funciones con las
-// que el kernel arranca hilos nuevos. Se guardan y se devuelve 0 = ninguna capacidad opcional del kernel
-// (sin cola de trabajo, sin QoS, sin bsdthread_ctl).
+// que el kernel arranca hilos nuevos. Se guardan y se devuelve la máscara de capacidades.
 uint64_t thread_start_fn, wqthread_fn, pthread_size;
+static uint32_t tsd_offset, mach_thread_self_offset;   // desplazamiento del TSD dentro de pthread_t (struct _pthread_registration_data, +24)
 static long bsd_bsdthread_register(struct ctx* c) {
 	thread_start_fn = c->a[0];
 	wqthread_fn = c->a[1];
 	pthread_size = c->a[2];
+	if (c->a[3]) { safe_read(c->a[3] + 24, &tsd_offset, 4); safe_read(c->a[3] + 32, &mach_thread_self_offset, 4); }
+	if (trace_all) logf_("    bsdthread_register: tsd_offset=0x%x mts_offset=0x%x\n", tsd_offset, mach_thread_self_offset);
 	if (trace_all) logf_("    bsdthread_register: start=0x%lx wq=0x%lx pthread_size=0x%lx\n", thread_start_fn, wqthread_fn, pthread_size);
-	return 0;
+	// Máscara de capacidades del kernel: libpthread exige FINEPRIO|BSDTHREADCTL|SETSELF|QOS_MAINTENANCE y
+	// QOS_DEFAULT; sin ella nunca marca el kernel como compatible y aborta con "has not been initialized".
+	return 0x4000007e;   // + KEVENT (0x20) y WORKLOOP (0x40): libdispatch los exige
 }
 
 
@@ -183,21 +190,18 @@ static long bsd_kill(struct ctx* c) {
 	long r = syscall(SYS_kill, (int)c->a[0], ls);
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
-static long bsd_pthread_kill(struct ctx* c) {
-	int s = (int)c->a[1];
-	if (s == 0) return 0;
-	if (s == 6) {
+void diag_crash(ucontext_t* uc) {
 		// SIGABRT: libpthread/libsystem dejan el motivo en su anotación de crash. Esta dirección es de la caché
 		// concreta de macOS 26.6.2 (gCRAnnotations.message de libsystem_pthread); sirve solo para diagnosticar.
 		uint64_t msgp = 0;
 		char msg[256] = "";
 		if (safe_read(0x7ff8430937b0UL, &msgp, 8) == 8 && msgp && safe_string(msgp, msg, sizeof msg) == 0 && msg[0])
 			logf_("    abort <%d>: \"%s\"\n", (int)getpid(), msg);
-		else {
+		{
 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
 			uint64_t sk[512] = { 0 };
-			ssize_t got = safe_read((uint64_t)c->uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
-			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)c->uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)c->uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)c->uc->uc_mcontext.gregs[REG_RBP]);
+			ssize_t got = safe_read((uint64_t)uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
+			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
 			for (int k = 0; k < 14 && k < (int)(got / 8); k++) logf_(" %lx", sk[k]);
 			logf_("\n    abort: llamadas plausibles:");
 			int shown = 0;
@@ -210,6 +214,13 @@ static long bsd_pthread_kill(struct ctx* c) {
 			}
 			logf_("\n");
 		}
+	}
+
+static long bsd_pthread_kill(struct ctx* c) {
+	int s = (int)c->a[1];
+	if (s == 0) return 0;
+	if (s == 6) {
+		diag_crash(c->uc);
 	}
 	int ls = darwin_to_linux_sig(s);
 	if (ls <= 0) return -D_EINVAL;
@@ -350,7 +361,50 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
 	return 0;
 }
 
+// bsdthread_create(func, arg, stack, pthread, flags): crea un hilo de Linux que arranca en thread_start (el
+// punto de entrada que libpthread registró en bsdthread_register) con la pila que eligió libpthread.
+struct new_thread { uint64_t pthread, func, arg, stack, flags; };
+extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
+static void* thread_main(void* p) {
+	struct new_thread t = *(struct new_thread*)p;
+	free(p);
+	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
+	uint64_t flags = t.flags & ~0x20000000u;
+	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = 0x203;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
+	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
+	enter_guest_thread(thread_start_fn, t.stack, t.pthread, 0x203 /*puerto del hilo*/, t.func, t.arg, t.stack, flags);
+}
+static long bsd_bsdthread_create(struct ctx* c) {
+	struct new_thread* t = malloc(sizeof *t);
+	if (!t) return -D_ENOMEM;
+	*t = (struct new_thread){ .pthread = c->a[3], .func = c->a[0], .arg = c->a[1], .stack = c->a[2], .flags = c->a[4] };
+	pthread_attr_t at; pthread_attr_init(&at);
+	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	pthread_attr_setstacksize(&at, 1 << 20);
+	pthread_t th;
+	int e = pthread_create(&th, &at, thread_main, t);
+	if (e) { free(t); return -35 /* EAGAIN de Darwin */; }
+	if (trace_all) logf_("    bsdthread_create: pthread=0x%lx stack=0x%lx flags=0x%lx\n", c->a[3], c->a[2], c->a[4]);
+	return (long)c->a[3];
+}
+// bsdthread_terminate(stackaddr, freesize, port, sem): libera la pila del hilo y termina solo este hilo.
+static long bsd_bsdthread_terminate(struct ctx* c) {
+	if (c->a[0] && c->a[1]) munmap((void*)c->a[0], c->a[1]);
+	syscall(SYS_exit, 0);
+	return 0;
+}
+
+// Colas de trabajo: de momento solo se aceptan las operaciones de configuración (WQOPS_SETUP_DISPATCH 0x400);
+// no hay hilos de cola de trabajo gestionados por el "kernel".
+static long bsd_workq_open(struct ctx* c) { (void)c; return 0; }
+static long bsd_workq_kernreturn(struct ctx* c) {
+	if (trace_all) logf_("    workq_kernreturn(op=0x%lx) -> sin efecto\n", c->a[0]);
+	return 0;
+}
+
 void emu_proc_init(void) {
+	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
+	reg_bsd(360, bsd_bsdthread_create); reg_bsd(361, bsd_bsdthread_terminate);
 	reg_bsd(478, bsd_bsdthread_ctl);
 	reg_bsd(2, bsd_fork); reg_bsd(66, bsd_fork); reg_bsd(7, bsd_wait4); reg_bsd(42, bsd_pipe);
 	reg_bsd(31, bsd_getpeername); reg_bsd(59, bsd_execve);

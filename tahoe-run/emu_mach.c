@@ -229,6 +229,7 @@ static long mach_msg2(struct ctx* c) {
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
+	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
 	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto
 	case 8000: case 8001: n = mig_task_restartable_register(&h, rep); break;   // register y synchronize

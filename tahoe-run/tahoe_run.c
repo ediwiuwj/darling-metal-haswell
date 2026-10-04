@@ -598,7 +598,8 @@ uint64_t ctx_arg(struct ctx* c, int i) {
 void reg_bsd(unsigned num, emu_fn fn)  { if (num < BSD_NAMES_N) bsd_table[num] = fn; }
 void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num] = fn; }
 
-static char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+// Un selector por hilo: cada hilo de macOS es un hilo de Linux y el despacho se activa por hilo.
+static __thread char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 
 static void log_call(const char* kind, uint32_t num, const char* name, struct ctx* c, const char* verdict) {
 	logf_("  [%s] <%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
@@ -657,7 +658,35 @@ void reenable_dispatch(void) {
 		DIE("hijo: no puedo reactivar PR_SET_SYSCALL_USER_DISPATCH: %s", strerror(errno));
 }
 
+// Prepara un hilo nuevo de Linux (pila alterna para SIGSYS + despacho) y salta al código de macOS con los
+// registros que XNU deja a thread_start: rdi=pthread, rsi=puerto, rdx=func, rcx=arg, r8=pila, r9=flags.
+void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
+	if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
+	reenable_dispatch();
+	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
+	register uint64_t r8 __asm__("r8") = a4, r9 __asm__("r9") = a5, r10 __asm__("r10") = rsp;
+	register uint64_t rax __asm__("rax") = rip;
+	__asm__ volatile(
+		"movq %%r10, %%rsp\n\t"
+		"xorl %%ebx, %%ebx\n\txorl %%ebp, %%ebp\n\txorl %%r10d, %%r10d\n\txorl %%r11d, %%r11d\n\t"
+		"xorl %%r12d, %%r12d\n\txorl %%r13d, %%r13d\n\txorl %%r14d, %%r14d\n\txorl %%r15d, %%r15d\n\t"
+		"jmpq *%%rax\n\t" :: "D"(a0), "S"(a1), "d"(a2), "c"(a3), "r"(r8), "r"(r9), "r"(r10), "r"(rax) : "memory");
+	__builtin_unreachable();
+}
+
+// SIGILL en código de macOS suele ser un ud2 de libsystem tras un error fatal: se vuelca el motivo y la pila.
+static void on_sigill(int sig, siginfo_t* si, void* v) {
+	(void)sig; (void)si;
+	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+	logf_("    SIGILL <%d>\n", getpid());
+	diag_crash(v);
+	_exit(132);
+}
+
 static void install_dispatch(void) {
+	struct sigaction sa = { .sa_sigaction = on_sigill, .sa_flags = SA_SIGINFO | SA_ONSTACK };
+	sigaction(SIGILL, &sa, NULL);
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
 	if (sigaltstack(&ss, NULL) != 0) DIE("sigaltstack: %s", strerror(errno));
 	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = {

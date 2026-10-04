@@ -309,8 +309,11 @@ Qué se vio, por orden:
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
-3. **`launchd` como PID 1** (hecho el primer paso, ver arriba): siguiente, **hilos reales** (`bsdthread_create`), los
-   `fsctl` y mensajes de host que pide, y después Mach IPC con puertos reales entre procesos.
+3. **`launchd` como PID 1**: ya hay **hilos reales** (`bsdthread_create`/`bsdthread_terminate` sobre `pthread_create`
+   de Linux, un selector de despacho por hilo, GS en el TSD, puerto del hilo en `tsd+mach_thread_self_offset`) y
+   `bsdthread_register` devuelve la máscara de capacidades `0x4000007e` (libpthread aborta si es 0). Ahora falla en
+   **`kevent_qos` (374)**: hay que emular **kqueue/kevent** (sobre epoll) y las colas de trabajo (`workq_kernreturn`
+   hoy es un no-op); después `fsctl 0xc1044a50`, `map_with_linking_np` (550) y Mach IPC con puertos reales.
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);

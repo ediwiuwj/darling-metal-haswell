@@ -28,6 +28,8 @@ int darwin_open_flags(int darwin_flags);
 ssize_t safe_read(uint64_t addr, void* buf, size_t len);
 ssize_t safe_write(uint64_t addr, const void* buf, size_t len);
 int safe_string(uint64_t addr, char* out, size_t max);
+#include <ucontext.h>
+void diag_crash(ucontext_t* uc);
 extern const char* tahoe_root;
 extern char cache_guest_path[1024];   // ruta de la caché vista desde macOS (sin la raíz del host)
 extern uint64_t cache_ino;
