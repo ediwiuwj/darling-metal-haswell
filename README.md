@@ -108,6 +108,18 @@ que da 456 syscalls BSD frente a las 455 reales de XNU 26.
   `os_fault_with_payload` (529), `proc_info_extended_id` (545) y `map_with_linking_np` (550, solo arm64e).
 - Que un stub esté enlazado no significa que se ejecute: es una cota superior, no una medida dinámica.
 
+### Compilar Darling en un Codespace
+
+`tools/build_darling_codespace.sh` compila `mldr` (el cargador Mach-O) y `darlingserver` en un
+Codespace de 4 núcleos y 16 GB (Ubuntu 24.04): 170 pasos, sin errores, en pocos minutos. Con el árbol
+de Darling en el commit `60ba801d`. Tres cosas que costaron tiempo y quedan anotadas en el script:
+compilar en `/tmp` (disco aparte, ~118 GB; `/workspaces` solo deja ~12 GB), saltarse `git-lfs`
+(`GIT_LFS_SKIP_SMUDGE=1`; el submódulo `swift` pide credenciales) y que un clon abortado deja los
+submódulos vacíos aunque `git submodule status` diga que están bien.
+
+Esto compila solo las piezas de Linux. Las bibliotecas del lado macOS (`libsystem_kernel` y demás) usan
+el compilador cruzado de Darling y no se han construido todavía.
+
 `tools/dyld_iterate.py` automatiza esta prueba: ejecuta un binario en Darling, extrae la librería que
 falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
 anterior.
@@ -119,6 +131,7 @@ anterior.
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
 | `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
+| `tools/build_darling_codespace.sh` | Compila `mldr` y `darlingserver` de Darling en un Codespace |
 | `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
 | `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
