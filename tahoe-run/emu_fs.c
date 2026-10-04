@@ -146,13 +146,14 @@ static long bsd_fcntl(struct ctx* c) {
 	case 45: case 48: case 51: return 0;                  // F_RDAHEAD, F_NOCACHE, F_FULLFSYNC: sin efecto
 	case 50: {                                            // F_GETPATH: ruta del descriptor
 		char link[64], path[4096];
-		snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+		snprintf(link, sizeof link, "/proc/thread-self/fd/%d", fd);
 		ssize_t n = readlink(link, path, sizeof path - 1);
-		if (n < 0) return err();
+		if (n < 0) { if (trace_all) logf_("    F_GETPATH(fd=%d) fallo: %s\n", fd, strerror(errno)); return err(); }
 		path[n] = 0;
 		const char* p = path;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 		if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";    // quitar la raíz de macOS
+		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, p);
 		return safe_write(c->a[2], p, strlen(p) + 1) > 0 ? 0 : -D_EFAULT;
 	}
 	default:
@@ -220,12 +221,30 @@ static long bsd_fstatfs64(struct ctx* c) {
 #define ATTR_VOL_INFO  0x80000000u
 #define ATTR_VOL_CAPABILITIES 0x00020000u
 #define ATTR_VOL_UUID  0x00040000u
+static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
 static long bsd_getattrlist(struct ctx* c) {
 	char p[4096], b[4200];
 	uint32_t al[6] = { 0 };
 	struct stat s;
 	if (safe_string(c->a[0], p, sizeof p) != 0 || safe_read(c->a[1], al, sizeof al) != sizeof al) return -D_EFAULT;
 	uint32_t common = al[1], vol = al[2];
+	if (!vol) {                                           // atributos del objeto: empaquetado general
+		int nofollow = (c->a[4] & 1) != 0;
+		struct stat st;
+		const char* rpth = resolve(p, b, sizeof b);
+		if ((nofollow ? lstat(rpth, &st) : stat(rpth, &st)) != 0) return err();
+		char real[4096], gp2[4096];
+		const char* rp = realpath(rpth, real) ? real : p;
+		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
+		snprintf(gp2, sizeof gp2, "%s", rp[0] ? rp : "/");
+		const char* base = strrchr(gp2, '/');
+		base = base && base[1] ? base + 1 : gp2;
+		static uint8_t buf[8192];
+		size_t n = pack_entry(buf, common, al[3], al[4], base, gp2, &st, (c->a[4] & 8) != 0);
+		if (n > c->a[3]) { uint32_t tot = (uint32_t)n; safe_write(c->a[2], &tot, c->a[3] >= 4 ? 4 : 0); return 0; }
+		return safe_write(c->a[2], buf, n) == (ssize_t)n ? 0 : -D_EFAULT;
+	}
 	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_FULLPATH, known_v = ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES | ATTR_VOL_UUID;
 	if ((common & ~known_c) || (vol & ~known_v) || al[3] || al[4] || al[5]) {
 		logf_("    getattrlist(\"%s\"): atributos sin implementar common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", p, common, vol, al[3], al[4], al[5]);
@@ -360,15 +379,31 @@ static uint32_t vtype_of(mode_t m) {                       // fsobj_type_t
 	}
 }
 
-// Empaqueta una entrada de getattrlistbulk. El tamaño fijo depende de lo SOLICITADO (FSOPT_PACK_INVAL_ATTRS);
-// los atributos que no valen para el objeto quedan a cero y no se marcan en returned_attrs.
-static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const char* name, const struct stat* s) {
+// Empaqueta los atributos de un objeto (getattrlist y getattrlistbulk). El orden es el de sys/attr.h: primero
+// returned_attrs si se pidió, luego comunes, de directorio y de archivo, cada grupo por orden de bit. Los
+// atributos que no valen para el objeto (de archivo en un directorio y viceversa) se omiten, o quedan a cero sin
+// marcar en returned_attrs si se pidió FSOPT_PACK_INVAL_ATTRS.
+#define A_CMN_OBJTAG 0x10u
+#define A_CMN_OBJID 0x20u
+#define A_CMN_PAROBJID 0x80u
+#define A_CMN_FNDRINFO 0x4000u
+#define A_CMN_GENCOUNT 0x80000u
+#define A_CMN_DOCID 0x100000u
+#define A_CMN_USERACCESS 0x200000u
+#define A_CMN_PARENTID 0x4000000u
+#define A_CMN_FULLPATH2 0x08000000u
+#define A_CMN_ADDEDTIME 0x10000000u
+#define A_CMN_DPFLAGS 0x40000000u
+#define A_DIR_LINKCOUNT 0x1u
+#define A_DIR_ENTRYCOUNT 0x2u
+#define A_DIR_MOUNTSTATUS 0x4u
+static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, const char* name, const char* fullpath, const struct stat* s, int pack_inval) {
 	size_t n = 4;                                            // longitud total, se rellena al final
 	size_t ret_at = n;
-	n += 20;                                                 // attribute_set_t returned_attrs
-	uint32_t rc = 0, rf = 0;
+	if (common & A_CMN_RETURNED) n += 20;                    // attribute_set_t returned_attrs
+	uint32_t rc = 0, rd = 0, rf = 0;
 	int isdir = S_ISDIR(s->st_mode);
-	size_t name_ref = 0;
+	size_t name_ref = 0, path_ref = 0;
 #define P32(v) do { uint32_t t_ = (uint32_t)(v); memcpy(o + n, &t_, 4); n += 4; } while (0)
 #define P64(v) do { uint64_t t_ = (uint64_t)(v); memcpy(o + n, &t_, 8); n += 8; } while (0)
 #define PTS(ts) do { P64((ts).tv_sec); P64((ts).tv_nsec); } while (0)
@@ -376,26 +411,55 @@ static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const 
 	if (common & A_CMN_DEVID) { P32((major(s->st_dev) << 24) | (minor(s->st_dev) & 0xffffff)); rc |= A_CMN_DEVID; }
 	if (common & A_CMN_FSID) { P32((uint32_t)s->st_dev); P32(0x18); rc |= A_CMN_FSID; }
 	if (common & A_CMN_OBJTYPE) { P32(vtype_of(s->st_mode)); rc |= A_CMN_OBJTYPE; }
+	if (common & A_CMN_OBJTAG) { P32(0x17); rc |= A_CMN_OBJTAG; }                         // VT_APFS
+	if (common & A_CMN_OBJID) { P32((uint32_t)s->st_ino); P32((uint32_t)(s->st_ino >> 32)); rc |= A_CMN_OBJID; }
+	if (common & A_CMN_PAROBJID) { P32(0); P32(0); rc |= A_CMN_PAROBJID; }
 	if (common & A_CMN_CRTIME) { PTS(s->st_ctim); rc |= A_CMN_CRTIME; }
 	if (common & A_CMN_MODTIME) { PTS(s->st_mtim); rc |= A_CMN_MODTIME; }
 	if (common & A_CMN_CHGTIME) { PTS(s->st_ctim); rc |= A_CMN_CHGTIME; }
 	if (common & A_CMN_ACCTIME) { PTS(s->st_atim); rc |= A_CMN_ACCTIME; }
+	if (common & A_CMN_FNDRINFO) { memset(o + n, 0, 32); n += 32; rc |= A_CMN_FNDRINFO; }
 	if (common & A_CMN_OWNERID) { P32(s->st_uid); rc |= A_CMN_OWNERID; }
 	if (common & A_CMN_GRPID) { P32(s->st_gid); rc |= A_CMN_GRPID; }
 	if (common & A_CMN_ACCESSMASK) { P32(s->st_mode & 07777); rc |= A_CMN_ACCESSMASK; }
 	if (common & A_CMN_FLAGS) { P32(0); rc |= A_CMN_FLAGS; }
+	if (common & A_CMN_GENCOUNT) { P32(0); rc |= A_CMN_GENCOUNT; }
+	if (common & A_CMN_DOCID) { P32(0); rc |= A_CMN_DOCID; }
+	if (common & A_CMN_USERACCESS) {                                                      // R_OK 4, W_OK 2, X_OK 1 de Darwin = bits 4,2,1... se calcula por permisos del propietario/otros
+		uint32_t ua = 0; uid_t u = geteuid();
+		mode_t m = s->st_mode;
+		int sh = (u == s->st_uid) ? 6 : 0;
+		if (u == 0 || (m >> sh) & 4) ua |= 4;
+		if (u == 0 || (m >> sh) & 2) ua |= 2;
+		if (u == 0 || (m >> sh) & 1) ua |= 1;
+		P32(ua); rc |= A_CMN_USERACCESS;
+	}
 	if (common & A_CMN_FILEID) { P64(s->st_ino); rc |= A_CMN_FILEID; }
-	// atributos de archivo: solo para no directorios; en directorios se reserva el hueco a cero
+	if (common & A_CMN_PARENTID) { P64(0); rc |= A_CMN_PARENTID; }
+	if (common & A_CMN_FULLPATH2) { path_ref = n; n += 8; rc |= A_CMN_FULLPATH2; }
+	if (common & A_CMN_ADDEDTIME) { PTS(s->st_ctim); rc |= A_CMN_ADDEDTIME; }
+	if (common & 0x20000000u) { P32(0); rc |= 0x20000000u; }                              // ATTR_CMN_ERROR: sin error
+	if (common & A_CMN_DPFLAGS) { P32(0); rc |= A_CMN_DPFLAGS; }
+	// directorio: solo valen para directorios
+	if (dir) {
+		if (dir & A_DIR_LINKCOUNT) { P32(isdir ? s->st_nlink : 0); if (isdir) rd |= A_DIR_LINKCOUNT; }
+		if (dir & A_DIR_ENTRYCOUNT) { P32(0); if (isdir) rd |= A_DIR_ENTRYCOUNT; }
+		if (dir & A_DIR_MOUNTSTATUS) { P32(0); if (isdir) rd |= A_DIR_MOUNTSTATUS; }
+	}
+	// archivo: solo valen para no directorios
 	if (file & A_FILE_LINKCOUNT) { P32(isdir ? 0 : s->st_nlink); if (!isdir) rf |= A_FILE_LINKCOUNT; }
 	if (file & A_FILE_TOTALSIZE) { P64(isdir ? 0 : s->st_size); if (!isdir) rf |= A_FILE_TOTALSIZE; }
 	if (file & A_FILE_ALLOCSIZE) { P64(isdir ? 0 : (uint64_t)s->st_blocks * 512); if (!isdir) rf |= A_FILE_ALLOCSIZE; }
 	if (file & A_FILE_IOBLOCKSIZE) { P32(isdir ? 0 : s->st_blksize); if (!isdir) rf |= A_FILE_IOBLOCKSIZE; }
 	if (file & A_FILE_DEVTYPE) { P32(isdir ? 0 : (uint32_t)s->st_rdev); if (!isdir) rf |= A_FILE_DEVTYPE; }
 	if (file & A_FILE_DATALENGTH) { P64(isdir ? 0 : s->st_size); if (!isdir) rf |= A_FILE_DATALENGTH; }
-	if (common & A_CMN_RETURNED) rc |= A_CMN_RETURNED;
-	// cadena del nombre tras todo lo fijo
-	size_t nl = strlen(name) + 1;
+	if (file & 0x400u) { P64(isdir ? 0 : (uint64_t)s->st_blocks * 512); if (!isdir) rf |= 0x400u; }   // DATAALLOCSIZE
+	if (file & 0x1000u) { P64(0); if (!isdir) rf |= 0x1000u; }                                         // RSRCLENGTH
+	if (file & 0x2000u) { P64(0); if (!isdir) rf |= 0x2000u; }                                         // RSRCALLOCSIZE
+	(void)pack_inval;
+	// cadenas de longitud variable al final, en el orden de sus referencias
 	if (common & A_CMN_NAME) {
+		size_t nl = strlen(name) + 1;
 		int32_t off = (int32_t)(n - name_ref);
 		uint32_t len = (uint32_t)nl;
 		memcpy(o + name_ref, &off, 4);
@@ -403,14 +467,29 @@ static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const 
 		memcpy(o + n, name, nl);
 		n += (nl + 3) & ~3UL;
 	}
-	uint32_t ret[5] = { rc, 0, 0, rf, 0 };                   // commonattr, volattr, dirattr, fileattr, forkattr
-	memcpy(o + ret_at, ret, 20);
+	if (common & A_CMN_FULLPATH2) {
+		size_t pl = strlen(fullpath) + 1;
+		int32_t off = (int32_t)(n - path_ref);
+		uint32_t len = (uint32_t)pl;
+		memcpy(o + path_ref, &off, 4);
+		memcpy(o + path_ref + 4, &len, 4);
+		memcpy(o + n, fullpath, pl);
+		n += (pl + 3) & ~3UL;
+	}
+	if (common & A_CMN_RETURNED) {
+		uint32_t ret[5] = { rc | A_CMN_RETURNED, 0, rd, rf, 0 };     // commonattr, volattr, dirattr, fileattr, forkattr
+		memcpy(o + ret_at, ret, 20);
+	}
 	uint32_t total = (uint32_t)n;
 	memcpy(o, &total, 4);
 	return n;
 #undef P32
 #undef P64
 #undef PTS
+}
+static uint32_t dir_attrs_g;                              // dirattr de la petición en curso (getattrlistbulk)
+static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const char* name, const struct stat* s) {
+	return pack_entry(o, common, dir_attrs_g, file, name, "", s, 1);
 }
 
 // getattrlistbulk(fd, attrlist*, búfer, tamaño, opciones): devuelve cuántas entradas empaquetó (0 = fin).
@@ -419,13 +498,15 @@ static long bsd_getattrlistbulk(struct ctx* c) {
 	uint32_t al[6] = { 0 };
 	if (safe_read(c->a[1], al, sizeof al) != sizeof al) return -D_EFAULT;
 	uint32_t common = al[1], dir = al[3], file = al[4];
-	uint32_t known_c = A_CMN_NAME | A_CMN_DEVID | A_CMN_FSID | A_CMN_OBJTYPE | A_CMN_CRTIME | A_CMN_MODTIME | A_CMN_CHGTIME |
-		A_CMN_ACCTIME | A_CMN_OWNERID | A_CMN_GRPID | A_CMN_ACCESSMASK | A_CMN_FLAGS | A_CMN_FILEID | A_CMN_RETURNED;
-	uint32_t known_f = A_FILE_LINKCOUNT | A_FILE_TOTALSIZE | A_FILE_ALLOCSIZE | A_FILE_IOBLOCKSIZE | A_FILE_DEVTYPE | A_FILE_DATALENGTH;
-	if ((common & ~known_c) || (file & ~known_f) || dir || al[2] || al[5]) {
+	uint32_t known_c = A_CMN_NAME | A_CMN_DEVID | A_CMN_FSID | A_CMN_OBJTYPE | A_CMN_OBJTAG | A_CMN_OBJID | A_CMN_PAROBJID | A_CMN_CRTIME | A_CMN_MODTIME |
+		A_CMN_CHGTIME | A_CMN_ACCTIME | A_CMN_FNDRINFO | A_CMN_OWNERID | A_CMN_GRPID | A_CMN_ACCESSMASK | A_CMN_FLAGS | A_CMN_GENCOUNT | A_CMN_DOCID |
+		A_CMN_USERACCESS | A_CMN_FILEID | A_CMN_PARENTID | A_CMN_ADDEDTIME | 0x20000000u /*ERROR*/ | A_CMN_DPFLAGS | A_CMN_RETURNED;
+	uint32_t known_f = A_FILE_LINKCOUNT | A_FILE_TOTALSIZE | A_FILE_ALLOCSIZE | A_FILE_IOBLOCKSIZE | A_FILE_DEVTYPE | A_FILE_DATALENGTH | 0x400u | 0x1000u | 0x2000u;
+	if ((common & ~known_c) || (file & ~known_f) || (dir & ~7u) || al[2] || al[5]) {
 		logf_("    getattrlistbulk: atributos sin implementar common=0x%x dir=0x%x file=0x%x\n", common, dir, file);
 		return -45;
 	}
+	dir_attrs_g = dir;
 	uint64_t gbuf = c->a[2], gsize = c->a[3];
 	uint8_t lin[16384];
 	uint8_t* out = malloc(gsize);

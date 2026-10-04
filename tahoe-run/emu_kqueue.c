@@ -19,6 +19,7 @@ extern void wq_request_workloop(uint64_t, const void* req72);
 extern void wq_note_workloop(uint64_t);
 
 enum { EVFILT_READ = -1, EVFILT_WRITE = -2, EVFILT_SIGNAL = -6, EVFILT_TIMER = -7, EVFILT_MACHPORT = -8, EVFILT_USER = -10, EVFILT_WORKLOOP = -17 };
+static __thread uint64_t g_dout, g_davail;   // búfer de datos del kevent_qos en curso (mensajes Mach recibidos directamente)
 enum { EV_ADD = 1, EV_DELETE = 2, EV_ENABLE = 4, EV_DISABLE = 8, EV_ONESHOT = 0x10, EV_CLEAR = 0x20, EV_RECEIPT = 0x40, EV_ERROR = 0x4000 };
 #define NOTE_TRIGGER 0x01000000u
 #define NOTE_FFCTRLMASK 0xc0000000u
@@ -41,6 +42,7 @@ static void drop(struct knote* dead) {
 	for (struct knote** p = &notes; *p; p = &(*p)->next)
 		if (*p == dead) { *p = dead->next; break; }
 	if (dead->fd >= 0 && (dead->k.filter == EVFILT_TIMER || dead->k.filter == EVFILT_USER)) close(dead->fd);
+	else if (dead->fd >= 0 && dead->k.filter == EVFILT_MACHPORT) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
 	else if (dead->fd >= 0) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
 	free(dead);
 }
@@ -97,6 +99,14 @@ static int apply(int kq, const struct kev* c) {
 			epoll_ctl(kq, EPOLL_CTL_ADD, n->fd, &ev);
 			n->k.fflags &= NOTE_FFLAGSMASK;
 			break;
+		case EVFILT_MACHPORT: {
+			int pfd = port_eventfd((uint32_t)c->ident);
+			if (pfd < 0) { logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident); break; }
+			n->fd = pfd;
+			ev.events = EPOLLIN;
+			epoll_ctl(kq, EPOLL_CTL_ADD, pfd, &ev);
+			break;
+		}
 		case EVFILT_WORKLOOP:
 			if (c->fflags & 1 /*NOTE_WL_THREAD_REQUEST*/) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
 			break;
@@ -166,6 +176,22 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		struct kev k = n->k;
 		k.data = 1;
 		if (n->k.filter == EVFILT_READ) { int avail = 0; ioctl(n->fd, FIONREAD, &avail); k.data = avail; if (es[i].events & EPOLLHUP) k.flags |= 0x8000 /*EV_EOF*/; }
+		else if (n->k.filter == EVFILT_MACHPORT) {
+			// recepción directa: el mensaje se entrega en el búfer de datos y el evento apunta a él
+			if ((n->k.fflags & 2 /*MACH_RCV_MSG*/) && g_dout && g_davail) {
+				uint64_t avail = 0;
+				safe_read(g_davail, &avail, 8);
+				uint32_t total = 0;
+				long rr = avail ? mach_rx_message((uint32_t)n->k.ident, 0, n->k.fflags, g_dout, (uint32_t)avail, &total) : 0x10004004;
+				if (rr) { if (rr == 0x10004003) continue; k.fflags = (uint32_t)rr; }
+				else {
+					k.ext[0] = g_dout; k.ext[1] = total;
+					g_dout += (total + 15) & ~15u; avail -= (total + 15) & ~15u;
+					safe_write(g_davail, &avail, 8);
+				}
+			}
+			if (n->k.flags & 0x80 /*EV_DISPATCH*/) n->enabled = 0;
+		}
 		else if (n->k.filter == EVFILT_TIMER || n->k.filter == EVFILT_USER) { uint64_t cnt = 0; if (read(n->fd, &cnt, 8) == 8) k.data = (int64_t)cnt; }
 		kev_out(layout, raw, &k);
 		if (safe_write(evp + nout * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) return -D_EFAULT;
@@ -184,12 +210,13 @@ static int ts_ms(uint64_t p) {
 
 static long bsd_kqueue(struct ctx* c) { (void)c; int fd = epoll_create1(0); return fd < 0 ? -darwin_errno(errno) : fd; }
 // kevent(kq, changelist, nchanges, eventlist, nevents, timeout)
-static long bsd_kevent(struct ctx* c) { return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
+static long bsd_kevent(struct ctx* c) { g_dout = 0; return do_kevent((int)c->a[0], 0, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(c->a[5])); }
 // kevent64(kq, changelist, nchanges, eventlist, nevents, flags, timeout)
-static long bsd_kevent64(struct ctx* c) { return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6))); }
+static long bsd_kevent64(struct ctx* c) { g_dout = 0; return do_kevent((int)c->a[0], 1, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], ts_ms(ctx_arg(c, 6))); }
 // kevent_qos(kq, changelist, nchanges, eventlist, nevents, data_out, data_available, flags)
 static long bsd_kevent_qos(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6);
 	return do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
 }
 
@@ -204,7 +231,8 @@ int kq_workloop_fd(uint64_t id) {
 	return -1;
 }
 // Recoge sin esperar los eventos pendientes de un workloop (kevent_qos_s de 72 bytes). Devuelve cuántos.
-long kq_drain(uint64_t id, uint64_t evp, int max) {
+long kq_drain(uint64_t id, uint64_t evp, int max, uint64_t dout, uint64_t davail) {
+	g_dout = dout; g_davail = davail;
 	int kq = kq_workloop_fd(id);
 	return kq < 0 ? 0 : do_kevent(kq, 2, 0, 0, evp, max, 0);
 }
@@ -213,11 +241,12 @@ static long bsd_kevent_id(struct ctx* c) {
 	int kq = kq_workloop_fd(c->a[0]);
 	if (kq < 0) return -D_ENOMEM;
 	wq_note_workloop(c->a[0]);
+	g_dout = c->a[5]; g_davail = ctx_arg(c, 6);
 	return do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
 }
 
 void emu_kqueue_init(void) {
-	reg_bsd(375, bsd_kevent_id);
+	reg_bsd(375, bsd_kevent_id); reg_bsd(443, bsd_kqueue);   // guarded_kqueue_np(guard*, flags) = kqueue
 	reg_bsd(362, bsd_kqueue); reg_bsd(363, bsd_kevent); reg_bsd(369, bsd_kevent64); reg_bsd(374, bsd_kevent_qos);
 }
 

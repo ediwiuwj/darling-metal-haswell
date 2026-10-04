@@ -418,7 +418,8 @@ static uint64_t build_stack(uint64_t exe_mh, int argc, char** argv, char** envp,
 typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
-static long bsd_exit(struct ctx* c)  { _exit((int)c->a[0]); }
+extern void ports_cleanup(void);
+static long bsd_exit(struct ctx* c)  { ports_cleanup(); _exit((int)c->a[0]); }
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
@@ -462,11 +463,21 @@ static long bsd_open(struct ctx* c) {
 	if (tahoe_root && path[0] == '/') {
 		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
 		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
+		if (fd < 0 && (flags & O_CREAT)) goto done;            // crear siempre dentro de la raíz, nunca en el host
 	}
 	if (fd < 0) fd = syscall(SYS_open, path, flags, (int)c->a[2]);
+done:
 	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? -darwin_errno(errno) : fd;
 }
+// guarded_open_np(ruta, guard*, guardflags, oflags, mode): como open; la guarda se ignora.
+static long bsd_guarded_open(struct ctx* c) {
+	struct ctx c2 = *c;
+	c2.a[1] = c->a[3];
+	c2.a[2] = c->a[4];
+	return bsd_open(&c2);
+}
+static long bsd_guarded_close(struct ctx* c) { struct ctx c2 = *c; return bsd_close(&c2); }              // (fd, guard*)
 static long bsd_getentropy(struct ctx* c) {
 	long r = syscall(SYS_getrandom, c->a[0], c->a[1], 0);
 	return r < 0 ? -darwin_errno(errno) : 0;
@@ -509,12 +520,12 @@ static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
 	if ((int)c->a[0] == 2 && ((int)c->a[2] == 17 || (int)c->a[2] == 18)) {   // PIDUNIQIDENTIFIERINFO / BSDINFOWITHUNIQID
-		uint8_t b[136 + 48] = { 0 };
+		uint8_t b[136 + 56] = { 0 };
 		uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();
 		uint64_t uniq = pid;
 		memcpy(b + 12, &pid, 4); memcpy(b + 16, &ppid, 4);
 		memcpy(b + 20, &uid, 4); memcpy(b + 24, &gid, 4); memcpy(b + 28, &uid, 4); memcpy(b + 32, &gid, 4);
-		size_t off = (int)c->a[2] == 18 ? 136 : 0, size = off + 48;
+		size_t off = (int)c->a[2] == 18 ? 136 : 0, size = off + 56;
 		memcpy(b + 136 + 16, &uniq, 8);                     // p_uniqueid
 		if ((int)c->a[2] == 17) memcpy(b + 16, &uniq, 8);   // (en este sabor la estructura empieza en p_uuid)
 		const uint8_t* src = (int)c->a[2] == 18 ? b : b + 136;
@@ -534,7 +545,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
-	[5] = bsd_open, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
 };
 
 
@@ -548,7 +559,8 @@ enum { KERN_SUCCESS_ = 0, KERN_FAILURE_ = 5 };
 
 typedef emu_fn mach_fn;
 static long mach_task_self_trap(struct ctx* c)   { (void)c; return PORT_TASK_SELF; }
-static long mach_thread_self_trap(struct ctx* c) { (void)c; return PORT_THREAD_SELF; }
+__thread uint32_t g_thread_port = PORT_THREAD_SELF;   // nombre del puerto del hilo actual (único por hilo)
+static long mach_thread_self_trap(struct ctx* c) { (void)c; return g_thread_port; }
 static long mach_host_self_trap(struct ctx* c)   { (void)c; return PORT_HOST_SELF; }
 static long mach_reply_port_trap(struct ctx* c)  { (void)c; uint32_t p = next_port; next_port += 0x100; return p; }
 static long mach_vm_protect_trap(struct ctx* c) {
@@ -638,7 +650,8 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		if (num < BSD_NAMES_N && bsd_table[num]) { r = bsd_table[num](&c); verdict = "ok   "; }
 		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
 		if (trace_all || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
-		if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
+		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
+		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
 	} else if (cls == 1) {                                       // trampa Mach
 		const char* name = num < MACH_NAMES_N ? mach_names[num] : NULL;
@@ -678,7 +691,9 @@ void reenable_dispatch(void) {
 
 // Prepara un hilo nuevo de Linux (pila alterna para SIGSYS + despacho) y salta al código de macOS con los
 // registros que XNU deja a thread_start: rdi=pthread, rsi=puerto, rdx=func, rcx=arg, r8=pila, r9=flags.
+extern __thread uint32_t g_thread_port;
 void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+	g_thread_port = (uint32_t)a1;
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
 	if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
 	reenable_dispatch();
@@ -774,6 +789,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_mach_init();
 	emu_proc_init();
 	emu_kqueue_init();
+	emu_net_init();
 	emu_fs2_init();
 	emu_port_init();
 	emu_sem_init();

@@ -28,6 +28,7 @@ static long bsd_bsdthread_register(struct ctx* c) {
 
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -50,7 +51,27 @@ static long bsd_gettimeofday(struct ctx* c) {
 	return 0;
 }
 // shm_open: sin memoria compartida con nombre; los clientes (libnotify...) tienen ruta alternativa.
-static long bsd_shm_open(struct ctx* c) { (void)c; return -D_ENOENT; }
+// shm_open/shm_unlink: objetos de memoria compartida POSIX como archivos de /dev/shm con prefijo propio y nombre saneado.
+static int shm_host_name(uint64_t addr, char* out, size_t cap) {
+	char g[256];
+	if (safe_string(addr, g, sizeof g) != 0) return -1;
+	char* o = out + snprintf(out, cap, "/dev/shm/tahoe.%s.", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x");
+	for (char* s = g; *s && o < out + cap - 1; s++) *o++ = (*s == '/') ? '_' : *s;
+	*o = 0;
+	return 0;
+}
+static long bsd_shm_open(struct ctx* c) {
+	char h[400];
+	if (shm_host_name(c->a[0], h, sizeof h)) return -D_EFAULT;
+	int fd = open(h, darwin_open_flags((int)c->a[1]) | O_CLOEXEC, (mode_t)c->a[2]);
+	if (trace_all) logf_("    shm_open -> %s = %d\n", h, fd);
+	return fd < 0 ? -darwin_errno(errno) : fd;
+}
+static long bsd_shm_unlink(struct ctx* c) {
+	char h[400];
+	if (shm_host_name(c->a[0], h, sizeof h)) return -D_EFAULT;
+	return unlink(h) ? -darwin_errno(errno) : 0;
+}
 // ioctl: no se traduce ninguna petición todavía; 25 = ENOTTY ("no es un terminal"), lo correcto para isatty().
 static long bsd_ioctl(struct ctx* c) {
 	if (trace_all) logf_("    ioctl(fd=%d, 0x%lx)\n", (int)c->a[0], c->a[1]);
@@ -300,6 +321,8 @@ static void host_path(const char* guest, char* out, size_t cap) {
 }
 
 // execve: se relanza tahoe-run con el programa nuevo. Soporta "#!" (hasta 4 niveles).
+static char spawn_special_env[8][32];   // TAHOE_SP<n>=<puerto>: puertos especiales para el hijo (acciones de puerto de posix_spawn)
+static int spawn_special_n;
 static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn, pid_t* pidout) {
 	char gpath[4096], hpath[4200];
 	if (safe_string(pathp, gpath, sizeof gpath) != 0) return -D_EFAULT;
@@ -361,7 +384,7 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	nargv[k++] = (char*)g_dyld_path;
 	nargv[k++] = hpath;
 	for (int i = 1; i < ac; i++) nargv[k++] = av[i];
-	char** nenv = calloc(ec + 6, sizeof(char*));
+	char** nenv = calloc(ec + 8 + 8, sizeof(char*));
 	int e = 0;
 	for (int i = 0; i < ec; i++) nenv[e++] = ev[i];
 	char b1[4300], b2[4300];
@@ -369,8 +392,12 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	snprintf(b2, sizeof b2, "TAHOE_ARGV0=%s", av[0]);
 	nenv[e++] = b2;
 	static char b3[4300];
+	static char b4[200], b5[40];
+	if (getenv("TAHOE_PORTS")) { snprintf(b4, sizeof b4, "TAHOE_PORTS=%s", getenv("TAHOE_PORTS")); nenv[e++] = b4; }
+	if (getenv("TAHOE_PORTS_OWNER")) { snprintf(b5, sizeof b5, "TAHOE_PORTS_OWNER=%s", getenv("TAHOE_PORTS_OWNER")); nenv[e++] = b5; }
 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
+	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];
 	if (trace_all) logf_("    execve(\"%s\") -> relanzando tahoe-run\n", gpath);
 	if (spawn) {
 		int pe = posix_spawn(pidout, g_self_exe, NULL, NULL, nargv, nenv);
@@ -385,7 +412,7 @@ static long bsd_execve(struct ctx* c) { return exec_common(c->a[0], c->a[1], c->
 // posix_spawn(pid*, ruta, adesc*, argv, envp): crea un proceso nuevo de tahoe-run. De momento se ignoran los
 // atributos y las acciones sobre archivos (se avisa en el registro); POSIX_SPAWN_SETEXEC se trata como execve.
 static long bsd_posix_spawn(struct ctx* c) {
-	uint64_t ad[4] = { 0 };
+	uint64_t ad[6] = { 0 };
 	uint16_t psa_flags = 0;
 	if (c->a[2]) {
 		safe_read(c->a[2], ad, sizeof ad);                          // attr_size, attrp, file_actions_size, file_actions
@@ -393,7 +420,18 @@ static long bsd_posix_spawn(struct ctx* c) {
 	}
 	char gp[256] = "?";
 	safe_string(c->a[1], gp, sizeof gp);
-	logf_("    posix_spawn(\"%s\") attr_flags=0x%x acciones_archivo=%lu\n", gp, psa_flags, ad[2]);
+	spawn_special_n = 0;
+	if (ad[5] && ad[4] >= 8) {                                      // acciones de puerto: PSPA_SPECIAL (1) fija un puerto especial del hijo
+		int hdr[2] = { 0, 0 };
+		safe_read(ad[5], hdr, 8);
+		for (int i = 0; i < hdr[1] && i < 8; i++) {
+			uint32_t act[6] = { 0 };                                // port_type, mask, new_port, behavior, flavor, which
+			if (safe_read(ad[5] + 8 + i * 24, act, 24) != 24) break;
+			if (act[0] == 1 && spawn_special_n < 8) snprintf(spawn_special_env[spawn_special_n++], 32, "TAHOE_SP%u=%u", act[5], act[2]);
+			logf_("    posix_spawn: acción de puerto tipo=%u which=%u puerto=0x%x\n", act[0], act[5], act[2]);
+		}
+	}
+	logf_("    posix_spawn(\"%s\") attr_flags=0x%x ad=%lx,%lx,%lx,%lx,%lx,%lx\n", gp, psa_flags, ad[0], ad[1], ad[2], ad[3], ad[4], ad[5]);
 	if (psa_flags & 0x40) return exec_common(c->a[1], c->a[3], c->a[4], 0, NULL);
 	pid_t pid = 0;
 	long r = exec_common(c->a[1], c->a[3], c->a[4], 1, &pid);
@@ -418,9 +456,10 @@ static void* thread_main(void* p) {
 	free(p);
 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
 	uint64_t flags = t.flags & ~0x20000000u;
-	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = 0x203;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
+	uint32_t kport = alloc_port();                       // cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
+	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
-	enter_guest_thread(thread_start_fn, t.stack, t.pthread, 0x203 /*puerto del hilo*/, t.func, t.arg, t.stack, flags);
+	enter_guest_thread(thread_start_fn, t.stack, t.pthread, kport, t.func, t.arg, t.stack, flags);
 }
 static long bsd_bsdthread_create(struct ctx* c) {
 	struct new_thread* t = malloc(sizeof *t);
@@ -453,11 +492,22 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 #define WQ_TSD_SET    0x00200000u
 #define WQ_WORKLOOP   0x00400000u
 #define WQ_STACK      (1u << 20)
+static __thread uint64_t my_workloop;   // workloop que atiende este hilo
 struct wq_job { uint64_t kqid; int workloop, has_req; uint8_t req[72]; };
 struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };
 extern int kq_workloop_fd(uint64_t);
-extern long kq_drain(uint64_t, uint64_t, int);
+extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
+// El kernel solo lanza el hilo si el estado de la cola sigue siendo el que esperaba libdispatch:
+// (*ext[ADDR] & ext[MASK]) == ext[VALUE]; si cambió, la petición está obsoleta y se descarta.
+static int req_still_valid(const uint8_t* req) {
+	uint64_t ext[4];
+	memcpy(ext, req + 40, 32);
+	if (!ext[1] || !ext[2]) return 1;
+	uint64_t cur;
+	if (safe_read(ext[1], &cur, 8) != 8) return 1;
+	return (cur & ext[2]) == (ext[3] & ext[2]);
+}
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -472,10 +522,16 @@ static void* wq_main(void* p) {
 	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
 	int nev = 0;
+	my_workloop = j.workloop ? j.kqid : 0;
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
-		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev); if (d > 0) nev += (int)d; }
+		// búfer de datos (32 KB) para los mensajes Mach que el kernel entrega junto a los eventos
+		uint8_t* data = mmap(NULL, 32768 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		uint64_t* avail = (uint64_t*)(data + 32768);
+		*avail = 32768;
+		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
+		if (d > 0) nev += (int)d; }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
-	enter_guest_thread(wqthread_fn, self - 0x3000, self, 0x203, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
+	enter_guest_thread(wqthread_fn, self - 0x3000, self, alloc_port(), (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
 }
 
 static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
@@ -495,10 +551,11 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
-	int start = !w->running;
+	int valid = req_still_valid(req);
+	int start = !w->running && valid;
 	memcpy(w->req, req, 72); w->has_req = 1;
 	uint8_t copy[72]; memcpy(copy, req, 72);
-	if (start) w->running = 1; else w->pending = 1;
+	if (start) w->running = 1; else if (valid) w->pending = 1;
 	pthread_mutex_unlock(&wl_lock);
 	if (start) wq_spawn(kqid, 1, copy);
 }
@@ -507,7 +564,7 @@ static void wl_finished(uint64_t kqid) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
-	int again = w && w->pending;
+	int again = w && w->pending && req_still_valid(w->req);
 	if (w) { w->pending = 0; w->running = again; }
 	pthread_mutex_unlock(&wl_lock);
 	uint8_t copy[72];
@@ -549,8 +606,7 @@ static void wl_arm(uint64_t kqid) {
 }
 
 static long bsd_workq_open(struct ctx* c) { (void)c; return 0; }
-static __thread uint64_t my_workloop;   // workloop que atiende este hilo (se aprende en el primer kevent_id)
-void wq_note_workloop(uint64_t kqid) { my_workloop = kqid; }
+void wq_note_workloop(uint64_t kqid) { (void)kqid; }
 extern long kq_apply_changes(int layout, uint64_t chg, long n);
 
 static long bsd_workq_kernreturn(struct ctx* c) {
@@ -566,6 +622,12 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 	case 0x200: return 0;                                              // SHOULD_NARROW: no
 	case 0x80: return 0;                                               // SET_EVENT_MANAGER_PRIORITY
 	case 0x100: case 0x40: case 0x04: {                                // retorno de hilo: se aparca = termina
+		if (trace_all && op == 0x100) for (long i = 0; i < (long)(int)c->a[2] && i < 4; i++) {
+			uint8_t kv[72]; uint64_t id, ud, ext[4]; int16_t f; uint16_t fl; uint32_t ff;
+			if (safe_read(c->a[1] + i * 72, kv, 72) != 72) break;
+			memcpy(&id, kv, 8); memcpy(&f, kv + 8, 2); memcpy(&fl, kv + 10, 2); memcpy(&ud, kv + 16, 8); memcpy(&ff, kv + 24, 4); memcpy(ext, kv + 40, 32);
+			logf_("      retorno: ident=0x%lx filter=%d flags=0x%x fflags=0x%x udata=0x%lx ext=%lx,%lx,%lx,%lx\n", id, f, fl, ff, ud, ext[0], ext[1], ext[2], ext[3]);
+		}
 		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2]);
 		if (op == 0x100 && my_workloop) wl_finished(my_workloop);
 		syscall(SYS_exit, 0);
@@ -599,12 +661,13 @@ static long bsd_map_with_linking(struct ctx* c) { (void)c; return -D_ENOSYS; }
 // ulock (os_unfair_lock, dispatch_once, libpthread): ulock_wait/ulock_wake sobre futex de Linux. Con ULF_NO_ERRNO
 // (0x1000000) los errores vuelven como valor negativo en lugar de por errno; aquí se devuelven siempre como errno.
 #include <linux/futex.h>
-static long bsd_ulock_wait(struct ctx* c) {
+static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	uint32_t* addr = (uint32_t*)c->a[1];
 	uint32_t expect = (uint32_t)c->a[2];
 	struct timespec ts, *tp = NULL;
-	uint64_t us = (uint32_t)c->a[3];
-	if (c->a[3] != 0 && us) { ts.tv_sec = us / 1000000; ts.tv_nsec = (us % 1000000) * 1000; tp = &ts; }
+	if (timeout_ns) { ts.tv_sec = timeout_ns / 1000000000ULL; ts.tv_nsec = timeout_ns % 1000000000ULL; tp = &ts; }
+	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
+	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
 	long r = syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expect, tp, NULL, 0);
 	if (r == 0) return 0;
 	switch (errno) {
@@ -614,20 +677,24 @@ static long bsd_ulock_wait(struct ctx* c) {
 	default: return -darwin_errno(errno);
 	}
 }
+static long bsd_ulock_wait(struct ctx* c)  { return ulock_wait_impl(c, (uint64_t)(uint32_t)c->a[3] * 1000ULL); }   // plazo en microsegundos
+static long bsd_ulock_wait2(struct ctx* c) { return ulock_wait_impl(c, c->a[3]); }                                 // plazo en nanosegundos
 static long bsd_ulock_wake(struct ctx* c) {
+	if (c->a[0] & 0x1000000) c->raw_ret = 1;
 	long n = syscall(SYS_futex, (uint32_t*)c->a[1], FUTEX_WAKE_PRIVATE, (c->a[0] & 0x100) ? 0x7fffffff : 1, NULL, NULL, 0);
 	return n > 0 ? 0 : -D_ENOENT;
 }
 
 void emu_proc_init(void) {
-	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake);
+	reg_bsd(515, bsd_ulock_wait); reg_bsd(516, bsd_ulock_wake); reg_bsd(544, bsd_ulock_wait2);
 	reg_bsd(550, bsd_map_with_linking);
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
 	reg_bsd(357, bsd_getaudit_addr);
 	reg_bsd(428, bsd_audit_session_self);
-	reg_bsd(446, bsd_proc_rlimit_control);
+	reg_bsd(446, bsd_proc_rlimit_control); reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
+	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
 	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto
 	reg_bsd(50, bsd_proc_rlimit_control);   // setlogin: sin efecto
 	reg_bsd(367, bsd_workq_open); reg_bsd(368, bsd_workq_kernreturn);
@@ -643,6 +710,7 @@ void emu_proc_init(void) {
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
 	reg_bsd(98, bsd_connect); reg_bsd(170, bsd_csops_audittoken);
 	reg_bsd(97, bsd_socket);
+	reg_bsd(267, bsd_shm_unlink);
 	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open); reg_bsd(54, bsd_ioctl);
 	reg_bsd(366, bsd_bsdthread_register);
 }

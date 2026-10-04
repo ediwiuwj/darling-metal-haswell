@@ -1,112 +1,282 @@
-// Puertos Mach dentro de un proceso: derechos de recepción con cola de mensajes, conjuntos de puertos, envío y
-// recepción con mach_msg2. Los nombres son locales a cada proceso de tahoe-run; la comunicación entre procesos
-// (launchd <-> sus hijos) todavía no existe.
+// Puertos Mach compartidos entre los procesos de tahoe-run: derechos de recepción con cola de mensajes, conjuntos
+// de puertos y envío/recepción con mach_msg2 (ver la región compartida más abajo).
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 
 #include "tahoe.h"
 
-struct qmsg { uint32_t size; uint8_t* data; struct qmsg* next; };
-struct port { uint32_t name, set; int is_set, efd, count; struct qmsg *head, *tail; struct port* next; };
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <stddef.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
-static struct port* ports;
-static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cv;
+// ---------------------------------------------------------------- región compartida entre procesos
+// Todos los procesos de tahoe-run de un mismo arranque comparten una región (archivo en /dev/shm indicado por
+// TAHOE_PORTS) con la tabla de puertos y las colas de mensajes. Un nombre de puerto es global: el mismo número
+// designa el mismo puerto en cualquier proceso. El dueño del derecho de recepción es quien lo creó; para despertar
+// a su epoll (EVFILT_MACHPORT) cada puerto tiene un socket de datagramas con nombre abstracto.
+#define MAXPORTS 2048
+#define MAXMSG   512
+#define MSGSZ    (64 * 1024)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner; uint8_t used, is_set; };
+struct mslot { uint32_t next, size, total; uint8_t data[MSGSZ - 12]; };
+struct shm {
+	pthread_mutex_t lk; pthread_cond_t cv;
+	uint32_t next_name, free_head, magic, special[8];
+	struct sport ports[MAXPORTS];
+	struct mslot msgs[MAXMSG];
+};
+static struct shm* shm;
+static char shm_path[128], tag[32];
+static int local_sock[MAXPORTS];           // socket de despertar de los puertos propios (índice = posición en la tabla)
+
+void ports_cleanup(void);
+void ports_cleanup(void) { if (getenv("TAHOE_PORTS_OWNER") && !strcmp(getenv("TAHOE_PORTS_OWNER"), tag)) unlink(shm_path); }
+
+static void shm_init(void) {
+	const char* env = getenv("TAHOE_PORTS");
+	int creator = 0;
+	if (env) snprintf(shm_path, sizeof shm_path, "%s", env);
+	else { snprintf(shm_path, sizeof shm_path, "/dev/shm/tahoe-ports-%d-%ld", (int)getpid(), (long)time(NULL)); creator = 1; }
+	int fd = open(shm_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) { logf_("    puertos: no puedo abrir %s: %s\n", shm_path, strerror(errno)); exit(70); }
+	if (creator && ftruncate(fd, sizeof(struct shm)) != 0) { logf_("    puertos: ftruncate: %s\n", strerror(errno)); exit(70); }
+	shm = mmap(NULL, sizeof(struct shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (shm == MAP_FAILED) { logf_("    puertos: mmap: %s\n", strerror(errno)); exit(70); }
+	if (creator) {
+		pthread_mutexattr_t ma; pthread_mutexattr_init(&ma); pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED); pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
+		pthread_mutex_init(&shm->lk, &ma);
+		pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+		pthread_cond_init(&shm->cv, &ca);
+		shm->next_name = 0x2503;
+		for (int i = 0; i < MAXMSG; i++) shm->msgs[i].next = i + 1 < MAXMSG ? (uint32_t)(i + 2) : 0;   // índices desde 1; 0 = fin
+		shm->free_head = 1;
+		shm->magic = 0x7a110001;
+		snprintf(tag, sizeof tag, "%d", (int)getpid());
+		setenv("TAHOE_PORTS", shm_path, 1);
+		setenv("TAHOE_PORTS_OWNER", tag, 1);
+		atexit(ports_cleanup);
+	} else {
+		snprintf(tag, sizeof tag, "%d", (int)getpid());
+	}
+	for (int i = 0; i < MAXPORTS; i++) local_sock[i] = -1;
+}
 static pthread_once_t once = PTHREAD_ONCE_INIT;
-static void init_cv(void) { pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a, CLOCK_MONOTONIC); pthread_cond_init(&cv, &a); }
+static void init_all(void) { shm_init(); }
+static void lock(void) { pthread_once(&once, init_all); int r = pthread_mutex_lock(&shm->lk); if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk); }
+static void unlock(void) { pthread_mutex_unlock(&shm->lk); }
 
 enum { KERN_OK = 0, KERN_INVALID_NAME_ = 15, KERN_INVALID_RIGHT_ = 17, KERN_INVALID_VALUE_ = 18 };
 #define MACH_RCV_TIMED_OUT 0x10004003
 #define MACH_RCV_TOO_LARGE_ 0x10004004
 
-static struct port* find_locked(uint32_t name) {
-	for (struct port* p = ports; p; p = p->next) if (p->name == name) return p;
+// Los nombres se piden siempre a la región compartida (también los de semáforos y puertos del kernel falsos).
+uint32_t alloc_port(void) {
+	lock();
+	uint32_t n = shm->next_name;
+	shm->next_name += 0x100;
+	unlock();
+	return n;
+}
+
+static struct sport* find_locked(uint32_t name) {
+	for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].name == name) return &shm->ports[i];
 	return NULL;
+}
+static int port_index(struct sport* p) { return (int)(p - shm->ports); }
+
+// Despierta a quien espere por un puerto con epoll (el dueño puede ser otro proceso).
+static void poke(uint32_t name) {
+	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (s < 0) return;
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name);
+	char b = 1;
+	if (sendto(s, &b, 1, 0, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) {}
+	close(s);
+}
+static void drain_one(int fd) { char b; if (fd >= 0 && recv(fd, &b, 1, MSG_DONTWAIT) < 0) {} }
+
+static int make_wake_socket(uint32_t name) {
+	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (s < 0) return -1;
+	struct sockaddr_un a = { .sun_family = AF_UNIX };
+	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name);
+	if (bind(s, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) { close(s); return -1; }
+	return s;
 }
 
 uint32_t port_create(int is_set) {
-	pthread_once(&once, init_cv);
-	struct port* p = calloc(1, sizeof *p);
-	p->is_set = is_set;
-	p->efd = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC);
-	p->name = alloc_port();
-	pthread_mutex_lock(&lk);
-	p->next = ports; ports = p;
-	pthread_mutex_unlock(&lk);
-	return p->name;
+	uint32_t name = alloc_port();
+	lock();
+	struct sport* p = NULL;
+	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; break; }
+	if (!p) { unlock(); logf_("    puertos: tabla llena\n"); return 0; }
+	memset(p, 0, sizeof *p);
+	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid();
+	local_sock[port_index(p)] = make_wake_socket(name);
+	unlock();
+	return name;
 }
 
-int port_exists(uint32_t name) { pthread_mutex_lock(&lk); int r = find_locked(name) != NULL; pthread_mutex_unlock(&lk); return r; }
+int port_exists(uint32_t name) { lock(); int r = find_locked(name) != NULL; unlock(); return r; }
 
-// eventfd que está legible mientras haya mensajes (para EVFILT_MACHPORT). -1 si el puerto no existe.
-int port_eventfd(uint32_t name) { pthread_mutex_lock(&lk); struct port* p = find_locked(name); int r = p ? p->efd : -1; pthread_mutex_unlock(&lk); return r; }
+// Socket legible mientras haya mensajes pendientes (solo para puertos que creó este proceso). -1 si no.
+int port_eventfd(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? local_sock[port_index(p)] : -1; unlock(); return r; }
+
+static void free_msgs_locked(struct sport* p) {
+	while (p->head) { struct mslot* q = &shm->msgs[p->head - 1]; uint32_t nx = q->next; q->next = shm->free_head; shm->free_head = p->head; p->head = nx; }
+	p->tail = 0; p->count = 0;
+}
 
 static void destroy(uint32_t name) {
-	pthread_mutex_lock(&lk);
-	for (struct port** pp = &ports; *pp; pp = &(*pp)->next) {
-		struct port* p = *pp;
-		if (p->name != name) continue;
-		*pp = p->next;
-		for (struct port* m = ports; m; m = m->next) if (m->set == name) m->set = 0;
-		while (p->head) { struct qmsg* q = p->head; p->head = q->next; free(q->data); free(q); }
-		close(p->efd); free(p);
-		break;
+	lock();
+	struct sport* p = find_locked(name);
+	if (p) {
+		int i = port_index(p);
+		for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used && shm->ports[k].set == name) shm->ports[k].set = 0;
+		free_msgs_locked(p);
+		if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
+		p->used = 0;
+		pthread_cond_broadcast(&shm->cv);   // quien espere en este puerto debe enterarse de que murió
 	}
-	pthread_mutex_unlock(&lk);
+	unlock();
 }
 
-// Encola un mensaje completo (cabecera ya con los campos reales). 0 si el puerto existe.
+// Descriptores OOL (tipos 1 y 3 = memoria, 2 = puertos): el contenido se copia dentro del mensaje porque la
+// dirección del emisor no vale en el proceso receptor.
+static int ool_scan(const uint8_t* m, uint32_t size, uint32_t* out_off, uint32_t* out_len, int max) {
+	if (size < 28 || !(m[3] & 0x80)) return 0;
+	uint32_t cnt; memcpy(&cnt, m + 24, 4);
+	uint32_t off = 28;
+	int n = 0;
+	for (uint32_t i = 0; i < cnt && off + 12 <= size; i++) {
+		uint8_t type = m[off + 11];
+		if (type == 0) { off += 12; continue; }
+		if (off + 16 > size) break;
+		if (n < max) { out_off[n] = off; memcpy(&out_len[n], m + off + 12, 4); n++; }
+		off += 16;
+	}
+	return n;
+}
+
+// Encola un mensaje completo (cabecera con los campos reales). 0 si el puerto existe.
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size) {
-	pthread_once(&once, init_cv);
-	pthread_mutex_lock(&lk);
-	struct port* p = find_locked(dest);
-	if (!p || p->is_set) { pthread_mutex_unlock(&lk); return -1; }
-	struct qmsg* q = malloc(sizeof *q);
-	q->size = size; q->data = malloc(size); memcpy(q->data, msg, size); q->next = NULL;
-	if (p->tail) p->tail->next = q; else p->head = q;
-	p->tail = q; p->count++;
-	uint64_t one = 1;
-	if (write(p->efd, &one, 8) < 0) {}
-	if (p->set) { struct port* s = find_locked(p->set); if (s) { s->count++; if (write(s->efd, &one, 8) < 0) {} } }
-	pthread_cond_broadcast(&cv);
-	pthread_mutex_unlock(&lk);
+	uint32_t ooff[32], olen[32];
+	uint8_t desc_fix[32 * 16];
+	int nool = ool_scan(msg, size, ooff, olen, 32);
+	uint64_t total = size;
+	for (int i = 0; i < nool; i++) total += olen[i];
+	(void)desc_fix;
+	if (total > sizeof(((struct mslot*)0)->data)) { logf_("    puertos: mensaje de %lu bytes demasiado grande\n", (unsigned long)total); return -1; }
+	lock();
+	struct sport* p = find_locked(dest);
+	if (!p || p->is_set || !shm->free_head) { unlock(); return -1; }
+	uint32_t idx = shm->free_head;
+	struct mslot* q = &shm->msgs[idx - 1];
+	shm->free_head = q->next;
+	q->next = 0; q->size = size; q->total = (uint32_t)total;
+	memcpy(q->data, msg, size);
+	uint32_t pos = size;
+	for (int i = 0; i < nool; i++) {                       // copiar los bytes de cada descriptor OOL tras el mensaje
+		uint64_t addr; memcpy(&addr, msg + ooff[i], 8);
+		if (olen[i] && safe_read(addr, q->data + pos, olen[i]) != (ssize_t)olen[i]) memset(q->data + pos, 0, olen[i]);
+		pos += olen[i];
+	}
+	if (p->tail) shm->msgs[p->tail - 1].next = idx; else p->head = idx;
+	p->tail = idx; p->count++;
+	uint32_t setname = p->set;
+	if (setname) { struct sport* s = find_locked(setname); if (s) s->count++; }
+	pthread_cond_broadcast(&shm->cv);
+	unlock();
+	poke(dest);
+	if (setname) poke(setname);
 	return 0;
 }
 
 // Saca un mensaje de un puerto o de cualquier miembro de un conjunto. timeout_ms < 0: sin plazo.
 // Devuelve 0 con *out/*size (a liberar con free), o un código mach_msg de error.
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size) {
-	pthread_once(&once, init_cv);
 	struct timespec dl;
 	if (timeout_ms >= 0) { clock_gettime(CLOCK_MONOTONIC, &dl); dl.tv_sec += timeout_ms / 1000; dl.tv_nsec += (timeout_ms % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; } }
-	pthread_mutex_lock(&lk);
+	lock();
+	int waited = 0;
 	for (;;) {
-		struct port* p = find_locked(name);
-		if (!p) { pthread_mutex_unlock(&lk); return 0x10004008; /* MACH_RCV_INVALID_NAME */ }
-		struct port* src = NULL;
+		struct sport* p = find_locked(name);
+		if (!p) { unlock(); return waited ? 0x10004009 /* MACH_RCV_PORT_DIED */ : 0x10004008 /* MACH_RCV_INVALID_NAME */; }
+		struct sport* src = NULL;
 		if (!p->is_set) src = p->count ? p : NULL;
-		else for (struct port* m = ports; m; m = m->next) if (m->set == name && m->count) { src = m; break; }
+		else for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].set == name && shm->ports[i].count) { src = &shm->ports[i]; break; }
 		if (src) {
-			struct qmsg* q = src->head;
-			src->head = q->next; if (!src->head) src->tail = NULL;
+			uint32_t idx = src->head;
+			struct mslot* q = &shm->msgs[idx - 1];
+			src->head = q->next; if (!src->head) src->tail = 0;
 			src->count--;
-			uint64_t v;
-			if (read(src->efd, &v, 8) < 0) {}
-			if (src->set) { struct port* s = find_locked(src->set); if (s) { s->count--; if (read(s->efd, &v, 8) < 0) {} } }
-			*out = q->data; *size = q->size; free(q);
-			pthread_mutex_unlock(&lk);
+			if (src->set) { struct sport* s = find_locked(src->set); if (s && s->count) s->count--; }
+			uint32_t sz = q->size, tot = q->total;
+			uint8_t* m = malloc(tot ? tot : 1);
+			memcpy(m, q->data, tot);
+			q->next = shm->free_head; shm->free_head = idx;
+			int si = port_index(src);
+			int fd1 = local_sock[si], fd2 = -1;
+			if (src->set) { struct sport* s = find_locked(src->set); if (s) fd2 = local_sock[port_index(s)]; }
+			unlock();
+			drain_one(fd1); drain_one(fd2);
+			// materializar los descriptores OOL en memoria nueva de este proceso
+			uint32_t ooff[32], olen[32];
+			int nool = ool_scan(m, sz, ooff, olen, 32);
+			uint32_t pos = sz;
+			for (int i = 0; i < nool; i++) {
+				uint64_t addr = 0;
+				if (olen[i]) {
+					void* mem = mmap(NULL, (olen[i] + 4095u) & ~4095u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+					if (mem != MAP_FAILED) { memcpy(mem, m + pos, olen[i]); addr = (uint64_t)mem; }
+				}
+				memcpy(m + ooff[i], &addr, 8);
+				pos += olen[i];
+			}
+			*out = m; *size = sz;
 			return 0;
 		}
-		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&cv, &lk, &dl) : pthread_cond_wait(&cv, &lk);
-		if (r) { pthread_mutex_unlock(&lk); return MACH_RCV_TIMED_OUT; }
+		waited = 1;
+		if (trace_all) logf_("    mach_msg: espera mensaje en 0x%x (plazo %d ms)\n", name, timeout_ms);
+		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&shm->cv, &shm->lk, &dl) : pthread_cond_wait(&shm->cv, &shm->lk);
+		if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
+		else if (r) { unlock(); return MACH_RCV_TIMED_OUT; }
 	}
 }
+
+// Puertos especiales de la tarea (bootstrap = 4): compartidos, para que los hijos hereden el de launchd.
+// Puertos especiales de ESTA tarea. Los hijos reciben los suyos por el entorno (TAHOE_SP<n>) desde las acciones de
+// puerto de posix_spawn, como el bootstrap que launchd da a cada servicio.
+static uint32_t special[8];
+static pthread_once_t sp_once = PTHREAD_ONCE_INIT;
+static void sp_init(void) {
+	for (int i = 0; i < 8; i++) { char k[16]; snprintf(k, sizeof k, "TAHOE_SP%d", i); const char* v = getenv(k); if (v) special[i] = (uint32_t)strtoul(v, NULL, 10); }
+}
+// mach_ports_register(ports[3]): se guardan en la región compartida; los hijos los heredan (en XNU, task_create copia
+// itk_registered) y, mientras no tengan puerto bootstrap propio, usan el primero: así encuentran a launchd.
+void registered_ports_set(const uint32_t* p, int n) { lock(); for (int i = 0; i < 3; i++) shm->special[i] = i < n ? p[i] : 0; unlock(); }
+static uint32_t registered_port(int i) { lock(); uint32_t v = shm->special[i]; unlock(); return v; }
+uint32_t special_port_get(int which) {
+	pthread_once(&sp_once, sp_init);
+	if (which < 0 || which >= 8) return 0;
+	if (which == 4 && !special[4]) return registered_port(0);
+	return special[which];
+}
+void special_port_set(int which, uint32_t name) { pthread_once(&sp_once, sp_init); if (which >= 0 && which < 8) special[which] = name; }
 
 // ---------------------------------------------------------------- trampas Mach
 // mach_port_allocate_trap(task, right, *name): 1 = derecho de recepción, 3 = conjunto de puertos
@@ -135,27 +305,98 @@ static long t_mod_refs(struct ctx* c) {
 static long t_nop(struct ctx* c) { (void)c; return KERN_OK; }
 // mach_port_insert_member_trap(task, name, pset) / move_member(task, member, after)
 static long t_insert_member(struct ctx* c) {
-	pthread_mutex_lock(&lk);
-	struct port *p = find_locked((uint32_t)c->a[1]), *s = find_locked((uint32_t)c->a[2]);
+	lock();
+	struct sport *p = find_locked((uint32_t)c->a[1]), *st = find_locked((uint32_t)c->a[2]);
 	long r = KERN_INVALID_NAME_;
-	if (p && s && s->is_set) { p->set = s->name; r = KERN_OK; }
-	pthread_mutex_unlock(&lk);
+	if (p && st && st->is_set) { p->set = st->name; r = KERN_OK; }
+	unlock();
 	return r;
 }
 // mach_port_type_trap(task, name, *tipo): bits de MACH_PORT_TYPE_* del nombre
 static long t_type(struct ctx* c) {
 	uint32_t name = (uint32_t)c->a[1], t;
-	pthread_mutex_lock(&lk);
-	struct port* p = find_locked(name);
+	lock();
+	struct sport* p = find_locked(name);
 	t = p ? (p->is_set ? 1u << 19 : (1u << 17) | (1u << 16)) : (name >> 8) < 0x25 ? (1u << 16) : 0;   // nombres bajos = objetos del kernel
-	pthread_mutex_unlock(&lk);
+	unlock();
 	if (!t) return KERN_INVALID_NAME_;
 	return safe_write(c->a[2], &t, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 static long t_reply_port(struct ctx* c) { (void)c; return port_create(0); }
 
+// mach_generate_activity_id(task, cantidad, *id): identificadores de actividad (os_activity) únicos
+static long t_activity_id(struct ctx* c) {
+	static _Atomic uint64_t next = 1;
+	uint64_t n = c->a[1] ? c->a[1] : 1;
+	uint64_t id = atomic_fetch_add(&next, n) | ((uint64_t)getpid() << 40);
+	return safe_write(c->a[2], &id, 8) == 8 ? KERN_OK : KERN_INVALID_VALUE_;
+}
+
+// ---------------------------------------------------------------- mk_timer: puertos que reciben un mensaje al vencer
+// mach_absolute_time de este entorno son nanosegundos de CLOCK_MONOTONIC, así que el plazo se usa tal cual.
+struct mktimer { uint32_t name; int tfd; pthread_t th; int live; };
+static struct mktimer timers[64];
+static pthread_mutex_t timers_lock = PTHREAD_MUTEX_INITIALIZER;
+static void* mk_timer_thread(void* p) {
+	struct mktimer* t = p;
+	for (;;) {
+		uint64_t n;
+		ssize_t r = read(t->tfd, &n, 8);
+		if (r != 8) { if (errno == EINTR) continue; break; }
+		uint8_t msg[48] = { 0 };                                   // mk_timer_expire_msg: cabecera + 3 palabras sin uso
+		uint32_t bits = 0x11, size = 48, id = 0;
+		memcpy(msg, &bits, 4); memcpy(msg + 4, &size, 4); memcpy(msg + 8, &t->name, 4); memcpy(msg + 20, &id, 4);
+		port_send(t->name, msg, 48);
+	}
+	return NULL;
+}
+static struct mktimer* timer_find(uint32_t name) { for (int i = 0; i < 64; i++) if (timers[i].live && timers[i].name == name) return &timers[i]; return NULL; }
+static long t_mk_create(struct ctx* c) {
+	(void)c;
+	pthread_mutex_lock(&timers_lock);
+	struct mktimer* t = NULL;
+	for (int i = 0; i < 64; i++) if (!timers[i].live) { t = &timers[i]; break; }
+	if (!t) { pthread_mutex_unlock(&timers_lock); return 0; }
+	t->name = port_create(0);
+	t->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+	t->live = 1;
+	pthread_create(&t->th, NULL, mk_timer_thread, t);
+	pthread_detach(t->th);
+	pthread_mutex_unlock(&timers_lock);
+	return t->name;
+}
+static long t_mk_arm(struct ctx* c) {              // (name, expire) o (name, flags, expire, leeway)
+	struct mktimer* t = timer_find((uint32_t)c->a[0]);
+	if (!t) return KERN_INVALID_NAME_;
+	uint64_t exp = c->a[1];
+	struct itimerspec it = { .it_value = { exp / 1000000000ULL, exp % 1000000000ULL } };
+	if (!it.it_value.tv_sec && !it.it_value.tv_nsec) it.it_value.tv_nsec = 1;
+	timerfd_settime(t->tfd, TFD_TIMER_ABSTIME, &it, NULL);
+	return KERN_OK;
+}
+static long t_mk_arm_leeway(struct ctx* c) { struct ctx c2 = *c; c2.a[1] = c->a[2]; return t_mk_arm(&c2); }
+static long t_mk_cancel(struct ctx* c) {
+	struct mktimer* t = timer_find((uint32_t)c->a[0]);
+	if (!t) return KERN_INVALID_NAME_;
+	struct itimerspec cur, off = { 0 };
+	timerfd_settime(t->tfd, 0, &off, &cur);
+	uint64_t res = cur.it_value.tv_sec ? (uint64_t)cur.it_value.tv_sec * 1000000000ULL + cur.it_value.tv_nsec : cur.it_value.tv_nsec;
+	if (c->a[1]) safe_write(c->a[1], &res, 8);
+	return KERN_OK;
+}
+static long t_mk_destroy(struct ctx* c) {
+	struct mktimer* t = timer_find((uint32_t)c->a[0]);
+	if (!t) return KERN_INVALID_NAME_;
+	t->live = 0;
+	close(t->tfd);
+	destroy(t->name);
+	return KERN_OK;
+}
+
 void emu_port_init(void) {
+	reg_mach(91, t_mk_create); reg_mach(92, t_mk_destroy); reg_mach(93, t_mk_arm); reg_mach(94, t_mk_cancel); reg_mach(95, t_mk_arm_leeway);
+	reg_mach(43, t_activity_id);
 	reg_mach(16, t_allocate); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
 	reg_mach(18, t_nop); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_insert_member);
-	reg_mach(26, t_reply_port); reg_mach(76, t_type);
+	reg_mach(26, t_reply_port); reg_mach(50, t_reply_port); reg_mach(76, t_type);
 }

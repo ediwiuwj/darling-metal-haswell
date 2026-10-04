@@ -12,7 +12,7 @@ static inline uint64_t round_up(uint64_t v) { return (v + PAGE - 1) & ~(PAGE - 1
 #define STACK_TOP  0x00007ff7bff00000UL
 
 // Contexto de una syscall interceptada: número y hasta 6 argumentos (registros rdi, rsi, rdx, r10, r8, r9).
-struct ctx { uint64_t nr, a[6]; ucontext_t* uc; uint64_t ret2; int has_ret2; };   // ret2 -> rdx (fork, pipe)
+struct ctx { uint64_t nr, a[6]; ucontext_t* uc; uint64_t ret2; int has_ret2; int raw_ret; };   // raw_ret: devolver r tal cual (sin CF), p. ej. ULF_NO_ERRNO   // ret2 -> rdx (fork, pipe)
 typedef long (*emu_fn)(struct ctx*);
 
 uint64_t ctx_arg(struct ctx* c, int i);   // argumento i (0..7); a partir del 6.º va en la pila
@@ -42,6 +42,7 @@ void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);
 void emu_kqueue_init(void);
+void emu_net_init(void);
 void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
@@ -52,6 +53,10 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size);
 void emu_sem_init(void);
 uint32_t sem_create(int value);
 uint32_t alloc_port(void);
+long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
+uint32_t special_port_get(int which);
+void registered_ports_set(const uint32_t* p, int n);
+void special_port_set(int which, uint32_t name);
 void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
 
 // Códigos de error de Darwin

@@ -147,8 +147,6 @@ static size_t mig_host_get_clock_service(const struct hdr* req, const uint8_t* m
 }
 
 // Asignador de nombres de puerto: en Mach un nombre es (índice << 8 | generación); aquí solo importa que sean únicos.
-static uint32_t next_name = 0x2503;
-uint32_t alloc_port(void) { uint32_t n = next_name; next_name += 0x100; return n; }
 
 // Respuesta compleja con un único descriptor de puerto: cabecera (24) + cuerpo (4) + descriptor (12) = 40 bytes.
 static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition) {
@@ -181,11 +179,18 @@ static size_t mig_task_get_special_port(const struct hdr* req, const uint8_t* m,
 	int32_t which;
 	memcpy(&which, m + 32, 4);
 	if (trace_all) logf_("    task_get_special_port(%d)\n", which);
-	return reply_port(r, req, 0, 17);
+	return reply_port(r, req, special_port_get(which), 17);
 }
 
 // task_set_special_port (id 3410): descriptor de puerto + NDR + qué puerto. Se acepta sin efecto.
-static size_t mig_task_set_special_port(const struct hdr* req, uint8_t* r) { return reply_begin(r, req, KERN_SUCCESS_); }
+static size_t mig_task_set_special_port(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	uint32_t name, which;
+	memcpy(&name, m + 28, 4);                                   // descriptor de puerto: nombre en +28
+	memcpy(&which, m + 48, 4);                                  // cabecera 24 + cuerpo 4 + descriptor 12 + NDR 8
+	special_port_set((int)which, name);
+	if (trace_all) logf_("    task_set_special_port(%u) = 0x%x\n", which, name);
+	return reply_begin(r, req, KERN_SUCCESS_);
+}
 
 // task_info (id 3405): NDR, sabor, capacidad (en enteros). Sabores soportados: 15 (TASK_AUDIT_TOKEN).
 static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r) {
@@ -229,6 +234,22 @@ static size_t mig_host_get_exception_ports(const struct hdr* req, uint8_t* r) {
 	return n;
 }
 
+// mach_ports_lookup3 (id 3404): puertos registrados por el padre con mach_ports_register. Respuesta compleja con
+// exactamente 3 descriptores de puerto (cabecera 24 + cuenta 4 + 3*12 = 64 bytes), sin NDR ni retcode.
+static size_t mig_mach_ports_lookup(const struct hdr* req, uint8_t* r) {
+	uint32_t ports[3] = { special_port_get(4), 0, 0 };
+	struct hdr h = { .bits = 0x80000000u, .size = 64, .id = req->id + 100 };
+	memset(r, 0, 64);
+	memcpy(r, &h, sizeof h);
+	uint32_t three = 3;
+	memcpy(r + 24, &three, 4);
+	for (int i = 0; i < 3; i++) {
+		memcpy(r + 28 + i * 12, &ports[i], 4);
+		r[28 + i * 12 + 10] = 17;                      // disposición: MACH_MSG_TYPE_PORT_SEND; el tipo (byte 11) es 0 = descriptor de puerto
+	}
+	return 64;
+}
+
 // ---------------------------------------------------------------- mach_msg2
 // Recepción desde un puerto de usuario: saca el mensaje, ajusta la cabecera como lo hace el kernel (el puerto de
 // destino pasa a ser "local" y el de respuesta "remoto", con las disposiciones convertidas) y añade el trailer pedido.
@@ -239,10 +260,11 @@ static uint32_t rx_disp(uint32_t tx) {
 	default: return tx;
 	}
 }
-static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
-	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
+// Recibe un mensaje de `rcv_name` en `buf` (capacidad `cap`) con el trailer que piden las opciones (bits 24-27).
+// Devuelve 0 o un código mach_msg; *total = bytes escritos (mensaje + trailer).
+long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total) {
 	uint8_t* m; uint32_t size;
-	int r = port_receive(rcv_name, timeout, &m, &size);
+	int r = port_receive(rcv_name, timeout_ms, &m, &size);
 	if (r) return r;
 	struct hdr h;
 	memcpy(&h, m, sizeof h);
@@ -259,11 +281,18 @@ static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t
 	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
 	if (tsize >= 52) memcpy(tr + 20, at, 32);
 	long res = 0;
-	if (size + 8 > rcvsize && size + tsize > rcvsize) res = 0x10004004;     // MACH_RCV_TOO_LARGE
+	if (size + tsize > cap) res = 0x10004004;                               // MACH_RCV_TOO_LARGE
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = 0x10004003;
-	if (trace_all) logf_("    mach_msg2: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
+	else if (total) *total = size + tsize;
+	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
 	free(m);
 	return res;
+}
+
+static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
+	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
+	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_crash(c->uc);   // quién se bloquea esperando
+	return mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
 }
 
 static long mach_msg2(struct ctx* c) {
@@ -303,16 +332,31 @@ static long mach_msg2(struct ctx* c) {
 	case 2880: n = reply_port(rep, &h, 0, 17); break;   // io_service_get_matching_service: ningún servicio IOKit
 	case 413: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_set_special_port: sin efecto
 	case 205: n = reply_port(rep, &h, alloc_port(), 17); break;  // host_get_io_main
+	case 412: n = reply_port(rep, &h, 0, 17); break;               // host_get_special_port: puerto nulo
 	case 415: n = mig_host_get_exception_ports(&h, rep); break;
 	case 414: case 416: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // set / swap exception ports: sin efecto
 	case 1000: n = mig_clock_get_time(&h, rep); break;
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
-	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto
+	case 3404: n = mig_mach_ports_lookup(&h, rep); break;
+	case 3403: {                                                  // mach_ports_register: 3 descriptores de puerto
+		uint32_t cnt, ports[3] = { 0, 0, 0 };
+		memcpy(&cnt, req + 24, 4);
+		for (uint32_t i = 0; i < cnt && i < 3; i++) memcpy(&ports[i], req + 28 + i * 12, 4);
+		registered_ports_set(ports, (int)(cnt < 3 ? cnt : 3));
+		if (trace_all) logf_("    mach_ports_register: 0x%x 0x%x 0x%x\n", ports[0], ports[1], ports[2]);
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		break;
+	}     // mach_ports_register: sin efecto
 	case 8000: case 8001: n = mig_task_restartable_register(&h, rep); break;   // register y synchronize
 	case 3409: n = mig_task_get_special_port(&h, req, rep); break;
-	case 3410: n = mig_task_set_special_port(&h, rep); break;
+	case 3410: n = mig_task_set_special_port(&h, req, rep); break;
 	case 3405: n = mig_task_info(&h, req, rep); break;
 	default:
+		if (h.id >= 2800 && h.id < 2900) {                          // IOKit (device.defs): sin registro de E/S todavía -> kIOReturnNotFound
+			if (trace_all) logf_("    iokit id=%d -> kIOReturnNotFound\n", h.id);
+			n = reply_begin(rep, &h, (int32_t)0xe00002f0);
+			break;
+		}
 		logf_("    mach_msg2: opciones=0x%lx %s id=%d destino=0x%x local=0x%x (%u bytes, bits=0x%x) sin implementar -> MIG_BAD_ID\n",
 		      options, kobject ? "kobject" : "puerto", h.id, h.remote, h.local, ssize, h.bits);
 		hexdump(req, ssize < 128 ? ssize : 128);

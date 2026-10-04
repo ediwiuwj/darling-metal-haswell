@@ -31,8 +31,11 @@ static long bsd_mkdir(struct ctx* c)  { PATH1(p, 0); RET(mkdir(p, (mode_t)c->a[1
 static long bsd_rmdir(struct ctx* c)  { PATH1(p, 0); RET(rmdir(p)); }
 static long bsd_unlink(struct ctx* c) { PATH1(p, 0); RET(unlink(p)); }
 static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1])); }
-static long bsd_chown(struct ctx* c)  { PATH1(p, 0); RET(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
-static long bsd_lchown(struct ctx* c) { PATH1(p, 0); RET(lchown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
+// No somos root de verdad (espacio de usuarios con un solo uid/gid): cambiar a un propietario que no existe aquí
+// daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
+static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
+static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
+static long bsd_lchown(struct ctx* c) { PATH1(p, 0); return chown_result(lchown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
 static long bsd_truncate(struct ctx* c) { PATH1(p, 0); RET(truncate(p, (off_t)c->a[1])); }
 static long bsd_mkfifo(struct ctx* c) { PATH1(p, 0); RET(mkfifo(p, (mode_t)c->a[1])); }
 static long bsd_rename(struct ctx* c) { PATH1(a, 0); PATH1(b, 1); RET(rename(a, b)); }
@@ -44,7 +47,7 @@ static long bsd_symlink(struct ctx* c) {      // el destino del enlace se guarda
 	RET(symlink(tgt, l));
 }
 static long bsd_fchmod(struct ctx* c) { RET(fchmod((int)c->a[0], (mode_t)c->a[1])); }
-static long bsd_fchown(struct ctx* c) { RET(fchown((int)c->a[0], (uid_t)c->a[1], (gid_t)c->a[2])); }
+static long bsd_fchown(struct ctx* c) { return chown_result(fchown((int)c->a[0], (uid_t)c->a[1], (gid_t)c->a[2])); }
 static long bsd_ftruncate(struct ctx* c) { RET(ftruncate((int)c->a[0], (off_t)c->a[1])); }
 static long bsd_fsync(struct ctx* c)  { RET(fsync((int)c->a[0])); }
 static long bsd_flock(struct ctx* c) {        // LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 en Darwin
@@ -110,7 +113,39 @@ static long bsd_select(struct ctx* c) {
 	return r;
 }
 
+// ---- variantes *at: el descriptor de directorio AT_FDCWD de Darwin es -2
+static int dfd(uint64_t v) { return (int)v == -2 ? AT_FDCWD : (int)v; }
+// Ruta relativa al dirfd o absoluta -> bajo la raíz si es absoluta
+static long apath(uint64_t addr, char* out, size_t cap) {
+	char g[4096];
+	if (safe_string(addr, g, sizeof g) != 0) return -D_EFAULT;
+	if (tahoe_root && g[0] == '/') snprintf(out, cap, "%s%s", tahoe_root, g);
+	else snprintf(out, cap, "%s", g);
+	return 0;
+}
+static long bsd_renameat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(renameat(dfd(c->a[0]), a, dfd(c->a[2]), b)); }
+static long bsd_renameatx(struct ctx* c) {      // flags de Darwin: RENAME_SWAP 2, RENAME_EXCL 4
+	char a[4400], b[4400]; long e;
+	if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e;
+	unsigned lf = 0, f = (unsigned)c->a[4];
+	if (f & 2) lf |= 2; if (f & 4) lf |= 1;
+	RET(renameat2(dfd(c->a[0]), a, dfd(c->a[2]), b, lf));
+}
+static long bsd_unlinkat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(unlinkat(dfd(c->a[0]), p, (c->a[2] & 0x80) ? AT_REMOVEDIR : 0)); }   // AT_REMOVEDIR de Darwin = 0x80
+static long bsd_mkdirat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(mkdirat(dfd(c->a[0]), p, (mode_t)c->a[2])); }
+static long bsd_symlinkat(struct ctx* c) {
+	char tgt[4096], l[4400];
+	if (safe_string(c->a[0], tgt, sizeof tgt) != 0) return -D_EFAULT;
+	long e = apath(c->a[2], l, sizeof l); if (e) return e;
+	RET(symlinkat(tgt, dfd(c->a[1]), l));
+}
+static long bsd_fchmodat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; RET(fchmodat(dfd(c->a[0]), p, (mode_t)c->a[2], 0)); }
+static long bsd_fchownat(struct ctx* c) { char p[4400]; long e = apath(c->a[1], p, sizeof p); if (e) return e; return chown_result(fchownat(dfd(c->a[0]), p, (uid_t)c->a[2], (gid_t)c->a[3], (c->a[4] & 0x20) ? AT_SYMLINK_NOFOLLOW : 0)); }
+static long bsd_linkat(struct ctx* c) { char a[4400], b[4400]; long e; if ((e = apath(c->a[1], a, sizeof a)) || (e = apath(c->a[3], b, sizeof b))) return e; RET(linkat(dfd(c->a[0]), a, dfd(c->a[2]), b, 0)); }
+
 void emu_fs2_init(void) {
+	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
+	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
