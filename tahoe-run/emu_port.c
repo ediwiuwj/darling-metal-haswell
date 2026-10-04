@@ -139,6 +139,7 @@ uint32_t port_create(int is_set) {
 	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid();
 	local_sock[port_index(p)] = make_wake_socket(name);
 	unlock();
+	if (trace_all) logf_("    puerto 0x%x creado por pid %d (conjunto=%d)\n", name, (int)getpid(), is_set);
 	return name;
 }
 
@@ -348,6 +349,7 @@ static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
 	uint32_t n = port_create(flags & 8 /* MPO_PORTSET */);
+	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u contexto=0x%lx\n", n, opt[0], opt[1], c->a[2]); }
 	return safe_write(c->a[3], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 static long t_destruct(struct ctx* c) {

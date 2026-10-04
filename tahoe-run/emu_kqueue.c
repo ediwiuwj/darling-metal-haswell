@@ -101,6 +101,7 @@ static void knote_set_enabled(struct knote* n, int en) {
 
 // Aplica un cambio; devuelve 0 o un errno de Darwin.
 static int apply(int kq, const struct kev* c) {
+	if (trace_all && c->filter == EVFILT_MACHPORT) logf_("    kevent: cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", c->ident, c->flags, c->fflags, kq);
 	struct knote* n = find(kq, c->ident, c->filter);
 	if (c->flags & EV_DELETE) { if (!n) return D_ENOENT; drop(n); return 0; }
 	if (!n) {

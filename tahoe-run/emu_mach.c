@@ -342,7 +342,12 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		port_send(h.remote, req, ssize);
-		if (trace_all) logf_("    mach_msg2: envía a 0x%x id=%d (%u bytes)\n", h.remote, h.id, ssize);
+		if (h.id == 1023 && ssize == 24 && h.local) {                 // sondeo sin cuerpo con puerto de respuesta (experimento): se contesta vacío
+			struct hdr rh = { .bits = 0x12, .size = 24, .remote = h.local, .local = 0, .voucher = 0, .id = 1123 };
+			uint8_t rb[24]; memcpy(rb, &rh, 24);
+			port_send(h.local, rb, 24);
+		}
+		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
 		return (options & 2) ? user_receive(c, options, buf, rcv_name, rcvsize) : MACH_MSG_SUCCESS;
 	}
 	size_t n;
