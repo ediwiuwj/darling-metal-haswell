@@ -47,12 +47,40 @@ con `metal2vulkan`, ya se ejecuta correctamente en esta GPU usando Vulkan direct
    de 32 bits como la correcta. Con este kernel (solo `i32` y `float`) no se puede saber si `hasvk`
    emula de verdad aritmética de 64 bits cuando existe; no se probó.
 
+## Ejecutar el userland de macOS 26 en Darling (medido el 4 de octubre de 2026)
+
+Objetivo: que la interfaz del recovery de macOS 26 corra sobre el kernel de Linux, sin XNU.
+
+| Prueba | Resultado |
+|---|---|
+| `bin/ls` de macOS 26 (SDK 26.6.1, `minos 10.14`) | **Funciona** en Darling: usa la parte estable de la ABI |
+| `Language Chooser.app` (primera pantalla del recovery, `minos 26.6`, ~45 librerías) | Cae en la 8.ª: `libIASUnifiedProgress.dylib` (`No shared cache present`) |
+| Las 7 anteriores (`AVFoundation`, `SkyLight`, `CoreWLAN`...) | Son **stubs de Darling**, no las de Apple |
+| Extraer esa librería de la `dyld_shared_cache` con `ipsw` y ponerla en `DYLD_LIBRARY_PATH` | dyld la encuentra y la **rechaza** (`overlapping segments`) |
+
+**Por qué el extractor no sirve para cargar**: las imágenes de la caché están enlazadas de antemano
+a direcciones fijas de la caché. El dylib extraído conserva `LC_DYLD_INFO_ONLY`, pero sus tablas de
+*rebase*, *bind* y *lazy bind* salen **vacías**, y los punteros de `__got` siguen codificados con la
+información de *slide*. Sin esas tablas, ningún dyld sabe qué símbolo es cada puntero. Estas
+herramientas (`ipsw`, `DyldExtractor`...) sirven para desensamblar, no para cargar. Probado con
+`ipsw dyld extract` con y sin `--slide`.
+
+**Consecuencia**: la ruta viable no es extraer librerías sueltas, sino que un dyld cargue la caché
+completa, lo que exige implementar las syscalls de la región compartida (`shared_region_check_np`,
+`shared_region_map_and_slide_np`) en `darlingserver`, usar el `dyld` y la `libSystem` de Tahoe y
+reimplementar las syscalls y trampas Mach que XNU 12377 añadió respecto a Darwin 20.
+
+`tools/dyld_iterate.py` automatiza esta prueba: ejecuta un binario en Darling, extrae la librería que
+falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
+anterior.
+
 ## Qué hay en este repositorio
 
 | Ruta | Contenido |
 |---|---|
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+| `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
 | `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
