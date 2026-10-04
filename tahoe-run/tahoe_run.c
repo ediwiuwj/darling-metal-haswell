@@ -697,6 +697,7 @@ int main(int argc, char** argv, char** envp) {
 	const char* guest = real;
 	size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
 	if (rl && !strncmp(real, tahoe_root, rl) && real[rl] == '/') guest = real + rl;
+	if (tahoe_root && chdir(tahoe_root) != 0) LOG("aviso: no puedo entrar en TAHOE_ROOT: %s\n", strerror(errno));   // cwd inicial = "/" de macOS
 	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, guest);
 	memfd_init();
 	emu_sysctl_init();

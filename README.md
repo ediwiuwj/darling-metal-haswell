@@ -161,8 +161,15 @@ Errores propios que costaron encontrar, por si ayudan a otros:
 - Constantes de `getattrlist` mal copiadas (`0x08000000` es `FULLPATH`, no los flags de protección).
 - `libpthread` aborta con `BUG IN LIBPTHREAD: Token from the kernel is 0` si falta `ptr_munge=`.
 
-Siguiente: más programas (`cat`, `echo`, `uname`...), señales, hilos reales y `launchd`/Mach IPC con puertos de
-verdad; después, la parte gráfica (`SkyLight`, `QuartzCore`), que es la que llevaría al recovery.
+Programas probados con éxito (`exit=0`): `ls`, `ls -l`, `echo`, `cat`, `uname -a`, `pwd`.
+
+Limitación conocida: 63 de los 347 programas de `/bin`, `/usr/bin`, `/sbin` y `/usr/sbin` (y 10.626 archivos en
+total) están **vacíos** en el sistema extraído, porque `7z` no entiende la compresión transparente de HFS+
+(`decmpfs`, cuyo contenido va en la *resource fork*). No es un fallo del lanzador: hay que re-extraer con una
+herramienta que la soporte (`hfsfuse`, en AUR).
+
+Siguiente: señales, hilos reales y `launchd`/Mach IPC con puertos de verdad; después, la parte gráfica
+(`SkyLight`, `QuartzCore`), que es la que llevaría al recovery.
 
 ### Compilar Darling en un Codespace
 

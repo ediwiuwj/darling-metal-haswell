@@ -152,7 +152,7 @@ static long bsd_fcntl(struct ctx* c) {
 		path[n] = 0;
 		const char* p = path;
 		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
-		if (rl && !strncmp(path, tahoe_root, rl) && path[rl] == '/') p = path + rl;    // quitar la raíz de macOS
+		if (rl && !strncmp(path, tahoe_root, rl) && (path[rl] == '/' || path[rl] == '\0')) p = path[rl] ? path + rl : "/";    // quitar la raíz de macOS
 		return safe_write(c->a[2], p, strlen(p) + 1) > 0 ? 0 : -D_EFAULT;
 	}
 	default:
