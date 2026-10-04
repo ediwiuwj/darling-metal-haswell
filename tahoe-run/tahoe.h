@@ -42,6 +42,9 @@ void emu_fs_init(void);
 void emu_mach_init(void);
 void emu_proc_init(void);
 void emu_kqueue_init(void);
+void emu_sem_init(void);
+uint32_t sem_create(int value);
+uint32_t alloc_port(void);
 void reenable_dispatch(void);   // el kernel no hereda la interceptación de syscalls en el hijo de un fork
 
 // Códigos de error de Darwin

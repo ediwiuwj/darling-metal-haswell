@@ -47,6 +47,8 @@ static struct entry table[] = {
 	{ "kern.wq_stalled_window_usecs", { CTL_KERN, 0x7008 }, K_INT, 200, NULL },
 	{ "kern.wq_reduce_pool_window_usecs", { CTL_KERN, 0x7009 }, K_INT, 5000000, NULL },
 	{ "kern.wq_max_timer_interval_usecs", { CTL_KERN, 0x700a }, K_INT, 50000, NULL },
+	{ "kern.netboot", { CTL_KERN, 0x700b }, K_INT, 0, NULL },
+	{ "kern.dyld_flags", { CTL_KERN, 0x700c }, K_INT, 0, NULL },
 	{ "security.mac.lockdown_mode_state", { 200, 1 }, K_INT, 0, NULL },
 	{ "hw.machine", { CTL_HW, 1 }, K_STR, 0, "x86_64" },
 	{ "hw.model", { CTL_HW, 2 }, K_STR, 0, "MacBookPro16,1" },

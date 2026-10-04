@@ -420,6 +420,7 @@ static long bsd_getaudit_addr(struct ctx* c) {
 static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
 
 void emu_proc_init(void) {
+	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);
 	reg_bsd(357, bsd_getaudit_addr);

@@ -313,9 +313,11 @@ Qué se vio, por orden:
    hilos de trabajo en `epoll`) en vez de abortar. Lo que lo permitió: hilos reales (`bsdthread_create`), capacidades
    de libpthread (`0x4000007e`), **kqueue/kevent/kevent64/kevent_qos/kevent_id sobre epoll/timerfd/eventfd**
    (`emu_kqueue.c`; READ/WRITE/TIMER/USER con efecto, el resto se registra), auditoría, `proc_info` (sabores 17/18),
-   `clock_get_time` y varias llamadas aceptadas sin efecto. Siguiente: **Mach IPC con puertos reales** (hoy los
-   puertos son nombres ficticios y `launchd` no recibe mensajes), semáforos Mach (`semwait_signal`), `fsctl
-   0xc1044a50` y `map_with_linking_np` (550).
+   `clock_get_time` y varias llamadas aceptadas sin efecto. Hechos también: **semáforos Mach reales** (`emu_sem.c`: trampas 33-39, `__semwait_signal`) y los mensajes de
+   host/IOKit que pide al arrancar. `launchd` crea su segundo hilo y queda en reposo sin llamadas que falten.
+   Siguiente: **Mach IPC con puertos reales** (hoy los puertos son nombres ficticios y no hay colas de mensajes: sin
+   ellas `launchd` no puede registrar `bootstrap` ni lanzar los demonios de `/System/Library/LaunchDaemons`, que es el
+   camino hacia WindowServer). `fsctl 0xc1044a50` y `map_with_linking_np` (550) se rechazan y `launchd`/dyld lo toleran.
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);

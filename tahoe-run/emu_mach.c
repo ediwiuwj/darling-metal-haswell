@@ -148,7 +148,7 @@ static size_t mig_host_get_clock_service(const struct hdr* req, const uint8_t* m
 
 // Asignador de nombres de puerto: en Mach un nombre es (índice << 8 | generación); aquí solo importa que sean únicos.
 static uint32_t next_name = 0x2503;
-static uint32_t alloc_port(void) { uint32_t n = next_name; next_name += 0x100; return n; }
+uint32_t alloc_port(void) { uint32_t n = next_name; next_name += 0x100; return n; }
 
 // Respuesta compleja con un único descriptor de puerto: cabecera (24) + cuerpo (4) + descriptor (12) = 40 bytes.
 static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition) {
@@ -169,7 +169,7 @@ static size_t mig_semaphore_create(const struct hdr* req, const uint8_t* m, uint
 	memcpy(&policy, m + 32, 4);
 	memcpy(&value, m + 36, 4);
 	if (trace_all) logf_("    semaphore_create(política=%d, valor=%d)\n", policy, value);
-	return reply_port(r, req, alloc_port(), 17);
+	return reply_port(r, req, sem_create(value), 17);
 }
 
 // task_restartable_ranges_register (id 8000, subsistema task_restartable): libsystem registra rangos de código
@@ -241,6 +241,9 @@ static long mach_msg2(struct ctx* c) {
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto
+	case 2880: n = reply_port(rep, &h, 0, 17); break;   // io_service_get_matching_service: ningún servicio IOKit
+	case 413: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_set_special_port: sin efecto
+	case 205: n = reply_port(rep, &h, alloc_port(), 17); break;  // host_get_io_main
 	case 1000: n = mig_clock_get_time(&h, rep); break;
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
 	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto

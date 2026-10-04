@@ -767,6 +767,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_mach_init();
 	emu_proc_init();
 	emu_kqueue_init();
+	emu_sem_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
 		{ 396, 3 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },
