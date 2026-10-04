@@ -4,8 +4,9 @@ Notas, parches y pruebas de un proyecto en pausa: ejecutar software de macOS sob
 [Darling](https://github.com/darlinghq/darling) e intentar tener Metal en una GPU antigua
 (Intel HD 4400, driver Mesa `hasvk`, Vulkan 1.2).
 
-**Estado: en pausa (2 de octubre de 2026).** No hay nada que ejecute todavía un shader de Metal de
-principio a fin en esta GPU. Lo que sí está probado y lo que falta se detalla abajo.
+**Estado: en marcha (retomado el 4 de octubre de 2026).** Un kernel de Metal (AIR), traducido a SPIR-V
+con `metal2vulkan`, ya se ejecuta correctamente en esta GPU usando Vulkan directamente
+(`test/run_add_arrays.c`). Todavía **no** pasa por Indium ni por Darling: esa integración es lo que falta.
 
 ## Entorno de pruebas
 
@@ -30,9 +31,21 @@ principio a fin en esta GPU. Lo que sí está probado y lo que falta se detalla 
    alpha) traduce AIR a SPIR-V para Vulkan 1.2 y maneja punteros opacos. Con él, el kernel
    `add_arrays` del test de Indium produce SPIR-V que pasa `spirv-val --target-env vulkan1.2`
    (`test/add_arrays.vulkan1.2.spv`).
-6. **Ese SPIR-V pide `OpCapability Int64`**, y esta GPU no tiene `shaderInt64`. El origen es solo el
-   índice del array (`zext i32 → i64` en el `getelementptr`), así que se puede estrechar a 32 bits.
-   Es lo siguiente por hacer; **no está implementado**.
+6. **Ese SPIR-V pide `OpCapability Int64`**, aunque esta GPU tiene `shaderInt64 = false`. El origen es
+   solo el índice del array (`zext i32 → i64` en el `getelementptr`). `tools/narrow_int64.py` lo
+   estrecha a 32 bits y retira la capacidad: el resultado pasa `spirv-val --target-env vulkan1.2`.
+7. **Resultado en la GPU** (Intel HD 4400, Mesa 26.2.2, `test/run_add_arrays.c`, sin activar ninguna feature):
+
+   | SPIR-V | Pipeline | Resultado |
+   |---|---|---|
+   | original, con `Int64` | se crea | 64/64 correctos |
+   | índice de 32 bits, sin `Int64` | se crea | 64/64 correctos |
+
+   Es decir, `hasvk` **acepta y ejecuta bien** el shader con `Int64` aunque la feature esté desactivada.
+   Eso no lo hace válido: la especificación exige activar `shaderInt64`, la capa de validación lo
+   marcaría y otro driver podría rechazarlo o comportarse distinto. Por eso se mantiene la versión
+   de 32 bits como la correcta. Con este kernel (solo `i32` y `float`) no se puede saber si `hasvk`
+   emula de verdad aritmética de 64 bits cuando existe; no se probó.
 
 ## Qué hay en este repositorio
 
@@ -40,7 +53,9 @@ principio a fin en esta GPU. Lo que sí está probado y lo que falta se detalla 
 |---|---|
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
+| `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
+| `test/run_add_arrays.c` | Programa mínimo de Vulkan que ejecuta el kernel y comprueba `c = a + b` |
 
 ### Estado de los parches
 
@@ -64,13 +79,17 @@ python3 tools/extract_air.py add.metallib out/
 
 # 3. traducir y validar
 metal2vulkan out/module0.air add.spv     # imprime: spirv-val vulkan1.2: PASS
+
+# 4. (opcional) estrechar índices a 32 bits y ejecutar en la GPU
+python3 tools/narrow_int64.py add.spv add32.spv && spirv-val --target-env vulkan1.2 add32.spv
+clang -O1 -o run test/run_add_arrays.c -lvulkan && ./run add32.spv   # OK: 64/64 correctos
 ```
+El programa de prueba asume la interfaz de este kernel (3 buffers en `set 0` y 48 bytes de push constants).
 
 ## Pasos siguientes, por orden
 
-1. Opción `--no-int64` en `metal2vulkan` (o un paso posterior sobre el SPIR-V) que estreche el
-   índice a 32 bits y retire la capacidad. Comprobar que esta GPU crea el pipeline y ejecuta el
-   kernel.
+1. ~~Quitar el `Int64` y ejecutar el kernel en la GPU.~~ Hecho (puntos 6 y 7). Falta integrar el paso de
+   estrechado en `metal2vulkan` como opción (`--no-int64`) en lugar de usarlo aparte.
 2. Adaptar `Library::newLibrary` de Indium para usar `metal2vulkan` en lugar de Iridium (hay que
    traducir su reflexión de descriptores y push constants al `OutputInfo` que espera Indium).
 3. Compilar Darling con `ENABLE_METAL` y probar el ejemplo `triangle`.

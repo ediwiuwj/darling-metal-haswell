@@ -5,3 +5,7 @@ base/
 *.metallib
 build*/
 target/
+
+# Python
+__pycache__/
+*.pyc
