@@ -1,12 +1,23 @@
-# Metal sobre Vulkan en Darling, con una GPU Intel Haswell
+# tahoe-on-linux — macOS 26 (Tahoe) sobre el kernel de Linux, sin XNU
 
-Notas, parches y pruebas de un proyecto en pausa: ejecutar software de macOS sobre Linux con
-[Darling](https://github.com/darlinghq/darling) e intentar tener Metal en una GPU antigua
-(Intel HD 4400, driver Mesa `hasvk`, Vulkan 1.2).
+Capa de compatibilidad propia (`tahoe-run`, en C) que ejecuta binarios x86_64 de **macOS 26** directamente sobre Linux:
+traduce las syscalls BSD y las trampas Mach de XNU en espacio de usuario, y arranca el `launchd` real de la Recovery.
+Objetivo final: que la imagen de la Recovery se vea en pantalla y tener Metal (vía Vulkan, con Indium y `metal2vulkan`
+para una GPU Intel Haswell). [Darling](https://github.com/darlinghq/darling) se usa solo como referencia.
 
-**Estado: en marcha (retomado el 4 de octubre de 2026).** Un kernel de Metal (AIR), traducido a SPIR-V
-con `metal2vulkan`, ya se ejecuta correctamente en esta GPU usando Vulkan directamente
-(`test/run_add_arrays.c`). Todavía **no** pasa por Indium ni por Darling: esa integración es lo que falta.
+**Estado (4 de octubre de 2026):**
+- El `launchd` de macOS 26 corre como PID 1 en un espacio de nombres de PID, carga ~170 LaunchDaemons y lanza
+  **más de 30 demonios reales** (`syslogd`, `securityd`, `opendirectoryd`, `sandboxd`, `amfid`...). `WindowServer` y
+  `Installer Progress` arrancan y siguen vivos. Todavía **no hay imagen en pantalla**.
+- Un kernel de Metal (AIR) traducido a SPIR-V con `metal2vulkan` ya se ejecuta en la GPU por Vulkan
+  (`test/run_add_arrays.c`); aún no está integrado con Indium/Darling.
+- Detalle técnico, hallazgos y puntos de retoma: más abajo.
+
+Los binarios de Apple **no** se incluyen (hay que extraerlos de una Recovery propia). Licencia MIT para el código propio.
+
+---
+
+## Parte 1: Metal sobre Vulkan en una GPU antigua
 
 ## Entorno de pruebas
 
