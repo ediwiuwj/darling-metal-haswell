@@ -95,6 +95,19 @@ reimplementar las syscalls y trampas Mach que XNU 12377 añadió respecto a Darw
 - Es una medida aproximada: una syscall puede resolverse por otra vía, y solo importan las que las
   librerías de Tahoe llaman de verdad (eso aún no está medido).
 
+### Qué necesita de verdad el `dyld` de Tahoe
+
+`tools/used_syscalls.py` busca las instrucciones `syscall` de un Mach-O x86_64 (`mov eax, imm32` + `syscall`;
+la clase va en el byte alto: 1 Mach, 2 BSD, 3 machdep). Se valida contra `libsystem_kernel` de la caché,
+que da 456 syscalls BSD frente a las 455 reales de XNU 26.
+
+- El `dyld` de Tahoe enlaza 104 syscalls BSD y 61 trampas Mach. A Darling le faltan 18 BSD y 10 Mach.
+- La mayoría son ruido de enlazado (`mount`, `fmount`, `graftdmg`, `kdebug_*`). Las que están en el camino
+  de arranque son: `shared_region_map_and_slide_2_np` (536), `ulock_wait2` (544),
+  `terminate_with_payload` (520), `kqueue_workloop_ctl` (530), `openbyid_np` (479),
+  `os_fault_with_payload` (529), `proc_info_extended_id` (545) y `map_with_linking_np` (550, solo arm64e).
+- Que un stub esté enlazado no significa que se ejecute: es una cota superior, no una medida dinámica.
+
 `tools/dyld_iterate.py` automatiza esta prueba: ejecuta un binario en Darling, extrae la librería que
 falta de la caché y reintenta. Sirve para mapear la cadena de dependencias; se detiene en el fallo
 anterior.
@@ -106,6 +119,7 @@ anterior.
 | `patches/` | Parche para [`darlinghq/indium`](https://github.com/darlinghq/indium) (`git am`) |
 | `tools/extract_air.py` | Saca los módulos AIR de un `.metallib` |
 | `tools/compare_syscalls.py` | Compara las syscalls BSD y trampas Mach de un XNU con las de Darling |
+| `tools/used_syscalls.py` | Lista las syscalls BSD y trampas Mach que invoca un Mach-O x86_64 |
 | `tools/dyld_iterate.py` | Ejecuta un binario de macOS 26 en Darling extrayendo de la caché lo que falte |
 | `tools/narrow_int64.py` | Quita `Int64` de un SPIR-V cuando solo se usa para indexar (conservador) |
 | `test/add_arrays.vulkan1.2.spv` | SPIR-V generado por `metal2vulkan` (aún con `Int64`) |
