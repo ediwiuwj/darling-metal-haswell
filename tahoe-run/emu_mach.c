@@ -15,6 +15,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
+#include <time.h>
 #include "tahoe.h"
 
 #define MACH_MSG_SUCCESS     0
@@ -203,6 +204,16 @@ static size_t mig_task_info(const struct hdr* req, const uint8_t* m, uint8_t* r)
 	return reply_begin(r, req, KERN_INVALID_ARG);
 }
 
+// clock_get_time (id 1000, clock.defs): devuelve mach_timespec_t {u32 segundos, i32 nanosegundos}.
+static size_t mig_clock_get_time(const struct hdr* req, uint8_t* r) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	size_t n = reply_begin(r, req, KERN_SUCCESS_);
+	uint32_t v[2] = { (uint32_t)ts.tv_sec, (uint32_t)ts.tv_nsec };
+	memcpy(r + n, v, 8);
+	return n + 8;
+}
+
 // ---------------------------------------------------------------- mach_msg2
 static long mach_msg2(struct ctx* c) {
 	uint64_t options = c->a[1];
@@ -230,6 +241,7 @@ static long mach_msg2(struct ctx* c) {
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 225: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // (host, un entero): se acepta sin efecto
+	case 1000: n = mig_clock_get_time(&h, rep); break;
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
 	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto
 	case 8000: case 8001: n = mig_task_restartable_register(&h, rep); break;   // register y synchronize

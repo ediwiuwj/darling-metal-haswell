@@ -505,6 +505,20 @@ static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
 // proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
+	if ((int)c->a[0] == 2 && ((int)c->a[2] == 17 || (int)c->a[2] == 18)) {   // PIDUNIQIDENTIFIERINFO / BSDINFOWITHUNIQID
+		uint8_t b[136 + 48] = { 0 };
+		uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();
+		uint64_t uniq = pid;
+		memcpy(b + 12, &pid, 4); memcpy(b + 16, &ppid, 4);
+		memcpy(b + 20, &uid, 4); memcpy(b + 24, &gid, 4); memcpy(b + 28, &uid, 4); memcpy(b + 32, &gid, 4);
+		size_t off = (int)c->a[2] == 18 ? 136 : 0, size = off + 48;
+		memcpy(b + 136 + 16, &uniq, 8);                     // p_uniqueid
+		if ((int)c->a[2] == 17) memcpy(b + 16, &uniq, 8);   // (en este sabor la estructura empieza en p_uuid)
+		const uint8_t* src = (int)c->a[2] == 18 ? b : b + 136;
+		if (c->a[5] < size) return -DARWIN_EINVAL;
+		if (safe_write(c->a[4], src, size) != (ssize_t)size) return -D_EFAULT;
+		return (long)size;
+	}
 	return -DARWIN_EINVAL;
 }
 static long bsd_thread_selfid(struct ctx* c) { (void)c; return syscall(SYS_gettid); }
@@ -575,13 +589,14 @@ static long mach_vm_allocate_trap(struct ctx* c)   { return vm_alloc(c->a[1], c-
 static long mach_vm_map_trap(struct ctx* c)        { return vm_alloc(c->a[1], c->a[2], (int)c->a[4], c->a[3], (int)c->a[5] & 7); }
 static long mach_vm_deallocate_trap(struct ctx* c) { return munmap((void*)c->a[1], round_up(c->a[2])) == 0 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_; }
 static long mach_nop_success(struct ctx* c)        { (void)c; return KERN_SUCCESS_; }
+static long mach_not_supported(struct ctx* c)      { (void)c; return 46; /* KERN_NOT_SUPPORTED */ }
 static long mach_timebase_info_trap(struct ctx* c) {
 	uint32_t tb[2] = { 1, 1 };                         // el contador ya está en nanosegundos
 	return safe_write(c->a[0], tb, 8) == 8 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
 }
 static mach_fn mach_table[MACH_NAMES_N] = {
 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
-	[18] = mach_nop_success, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
+	[18] = mach_nop_success, [88] = mach_not_supported, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
 	[89] = mach_timebase_info_trap,
 	[14] = mach_vm_protect_trap,
 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
@@ -751,6 +766,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_fs_init();
 	emu_mach_init();
 	emu_proc_init();
+	emu_kqueue_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
 		{ 396, 3 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },

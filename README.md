@@ -309,11 +309,13 @@ Qué se vio, por orden:
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
-3. **`launchd` como PID 1**: ya hay **hilos reales** (`bsdthread_create`/`bsdthread_terminate` sobre `pthread_create`
-   de Linux, un selector de despacho por hilo, GS en el TSD, puerto del hilo en `tsd+mach_thread_self_offset`) y
-   `bsdthread_register` devuelve la máscara de capacidades `0x4000007e` (libpthread aborta si es 0). Ahora falla en
-   **`kevent_qos` (374)**: hay que emular **kqueue/kevent** (sobre epoll) y las colas de trabajo (`workq_kernreturn`
-   hoy es un no-op); después `fsctl 0xc1044a50`, `map_with_linking_np` (550) y Mach IPC con puertos reales.
+3. **`launchd` como PID 1**: ya arranca por completo y queda en reposo (hilo principal en `__semwait_signal`,
+   hilos de trabajo en `epoll`) en vez de abortar. Lo que lo permitió: hilos reales (`bsdthread_create`), capacidades
+   de libpthread (`0x4000007e`), **kqueue/kevent/kevent64/kevent_qos/kevent_id sobre epoll/timerfd/eventfd**
+   (`emu_kqueue.c`; READ/WRITE/TIMER/USER con efecto, el resto se registra), auditoría, `proc_info` (sabores 17/18),
+   `clock_get_time` y varias llamadas aceptadas sin efecto. Siguiente: **Mach IPC con puertos reales** (hoy los
+   puertos son nombres ficticios y `launchd` no recibe mensajes), semáforos Mach (`semwait_signal`), `fsctl
+   0xc1044a50` y `map_with_linking_np` (550).
 4. Señales reales, hilos y colas de trabajo; después la parte gráfica (`SkyLight`, `QuartzCore`, Indium/`metal2vulkan`).
 
 **Ideas sueltas ya validadas**: `PR_SET_SYSCALL_USER_DISPATCH` no se hereda en `fork` (reactivar en el hijo);
