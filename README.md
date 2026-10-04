@@ -302,13 +302,15 @@ Qué se vio, por orden:
 2. Abre `/dev/console` (sin permiso en el espacio de nombres): se redirige a `/dev/null`.
 3. `fsctl 0x40084a6a` (consulta privada de APFS del estado del dispositivo raíz, 8 bytes): se responde con ceros.
    Sin eso aborta con `failed to query root device status: 78` y llama a `reboot`.
-4. Lo siguiente que pide, y que ya no es trivial:
-   - **`bsdthread_create` (360)**: `launchd` crea hilos. Hace falta soporte real de hilos (con `clone`, TLS de macOS y la
-     interceptación de syscalls activa en cada hilo).
-   - **`fsctl 0xc1044a50`** (otra consulta de APFS, de entrada y salida, 260 bytes).
-   - **`mach_msg2` id 225 al host** (rutina del subsistema `host`) y, tras ellas, Mach IPC con puertos reales.
-   - `csops` operación 16 (derechos DER), la zona horaria (`/var/db/timezone/zoneinfo/posixrules`).
-   Después de esto el proceso muere con `SIGILL`.
+4. Lo siguiente que pidió, **ya resuelto** (el `launchd` ya no muere):
+   - `bsdthread_create`/`bsdthread_terminate`: hilos de Linux con selector de despacho propio por hilo.
+   - `fsctl 0xc1044a50` y `map_with_linking_np`: respuesta "no soportado"; `launchd` y `dyld` continúan.
+   - `mach_msg2` id 225 (host), `csops` 16 y la zona horaria: aceptados o con valores neutros.
+   - Después hicieron falta kqueue/kevent sobre epoll, workloops de libdispatch, semáforos y puertos Mach
+     compartidos entre procesos. Con eso `launchd` completa el arranque y lanza servicios (ver "Dónde retomar").
+
+> Nota: la versión anterior de esta sección decía que el proceso moría con `SIGILL`. Era el estado de un primer intento
+> y ya no es cierto: hoy `launchd` se queda en ejecución como PID 1.
 
 ## Dónde retomar (estado al 4 de octubre de 2026)
 
@@ -317,7 +319,7 @@ Qué se vio, por orden:
 `TAHOE_ROOT=<recovery extraído> ./tahoe-run <caché> <root>/usr/lib/dyld <root>/bin/ls /`.
 
 **Pendiente, por orden de utilidad**
-1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
+1. **`fork` con continuación en el hijo**: el hijo reinicializaba `libSystem` y abortaba (ver "Problema abierto"); no se ha vuelto a comprobar tras los cambios posteriores (los servicios usan `posix_spawn`, no `fork`).
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
 2. **Re-extracción con `hfsfuse`: hecha** (`tools/dmg2raw.py` convierte el UDIF a imagen cruda; se corta la partición HFS+ con `dd` y se monta con `hfsfuse --force -o ro`). Con 7z salían vacíos 10.624 archivos (9.564 con datos comprimidos y 1.005 enlaces simbólicos); ya están restaurados. `com.apple.cmio.registerassistantservice` falla con `exit(78)` porque su ejecutable no existe en la imagen (igual que en un Mac real).
 3. **`launchd` como PID 1 — arranca y sus demonios corren**: el `launchd` de macOS 26 (BaseSystem) completa su arranque,
