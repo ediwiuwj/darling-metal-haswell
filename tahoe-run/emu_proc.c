@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <pthread.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include "tahoe.h"
@@ -406,7 +407,10 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 #define WQ_WORKLOOP   0x00400000u
 #define WQ_STACK      (1u << 20)
 struct wq_job { uint64_t kqid; int workloop; };
-struct wl_state { uint64_t kqid; int running, pending; struct wl_state* next; };
+struct wl_state { uint64_t kqid; int running, pending, watching; struct wl_state* next; };
+extern int kq_workloop_fd(uint64_t);
+extern long kq_drain(uint64_t, uint64_t, int);
+static void wl_arm(uint64_t kqid);
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -420,9 +424,10 @@ static void* wq_main(void* p) {
 	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
 	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
-	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; }
+	int nev = 0;
+	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; nev = (int)kq_drain(j.kqid, events, 16); if (nev < 0) nev = 0; }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
-	enter_guest_thread(wqthread_fn, self - 0x3000, self, 0x203, (uint64_t)base, j.workloop ? events : 0, flags, 0);
+	enter_guest_thread(wqthread_fn, self - 0x3000, self, 0x203, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
 }
 
 static void wq_spawn(uint64_t kqid, int workloop) {
@@ -454,7 +459,40 @@ static void wl_finished(uint64_t kqid) {
 	int again = w && w->pending;
 	if (w) { w->pending = 0; w->running = again; }
 	pthread_mutex_unlock(&wl_lock);
-	if (again) wq_spawn(kqid, 1);
+	if (again) wq_spawn(kqid, 1); else wl_arm(kqid);
+}
+
+// Vigilante de un workloop inactivo: cuando su kqueue tiene eventos listos, lanza el hilo que los atiende.
+static void* wl_watch(void* p) {
+	uint64_t kqid = (uint64_t)p;
+	struct pollfd pf = { .fd = kq_workloop_fd(kqid), .events = POLLIN };
+	for (;;) {
+		if (poll(&pf, 1, -1) < 0 && errno != EINTR) break;
+		if (!(pf.revents & POLLIN)) continue;
+		pthread_mutex_lock(&wl_lock);
+		struct wl_state* w = wl_states;
+		while (w && w->kqid != kqid) w = w->next;
+		int go = w && !w->running;
+		if (w) { w->watching = 0; if (go) w->running = 1; }
+		pthread_mutex_unlock(&wl_lock);
+		if (go) wq_spawn(kqid, 1);
+		break;
+	}
+	return NULL;
+}
+static void wl_arm(uint64_t kqid) {
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
+	int start = !w->running && !w->watching;
+	if (start) w->watching = 1;
+	pthread_mutex_unlock(&wl_lock);
+	if (!start) return;
+	pthread_attr_t at; pthread_attr_init(&at);
+	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	pthread_t th;
+	if (pthread_create(&th, &at, wl_watch, (void*)kqid)) { pthread_mutex_lock(&wl_lock); w->watching = 0; pthread_mutex_unlock(&wl_lock); }
 }
 
 static long bsd_workq_open(struct ctx* c) { (void)c; return 0; }
@@ -502,7 +540,11 @@ static long bsd_getaudit_addr(struct ctx* c) {
 // sigsuspend(mask): aquí no hay señales de Darwin reales todavía; el hilo se duerme hasta que Linux lo interrumpa.
 static long bsd_sigsuspend(struct ctx* c) { (void)c; syscall(SYS_pause); return -4; /* EINTR */ }
 
+// map_with_linking_np (dyld): sin soporte; dyld aplica los fixups por su cuenta cuando devuelve error.
+static long bsd_map_with_linking(struct ctx* c) { (void)c; return -D_ENOSYS; }
+
 void emu_proc_init(void) {
+	reg_bsd(550, bsd_map_with_linking);
 	reg_bsd(322, bsd_proc_rlimit_control);   // iopolicysys: sin efecto
 	reg_bsd(331, bsd_proc_rlimit_control);   // __disable_threadsignal: sin efecto
 	reg_bsd(111, bsd_sigsuspend); reg_bsd(410, bsd_sigsuspend);

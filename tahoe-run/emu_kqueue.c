@@ -194,13 +194,21 @@ static long bsd_kevent_qos(struct ctx* c) {
 // kevent_id(id, changelist, nchanges, eventlist, nevents, data_out, data_available, flags): cola de trabajo de
 // libdispatch (workloop); cada identificador tiene su propio kqueue.
 static struct { uint64_t id; int kq; } workloops[64];
+int kq_workloop_fd(uint64_t id) {
+	for (int i = 0; i < 64; i++) {
+		if (workloops[i].kq > 0 && workloops[i].id == id) return workloops[i].kq;
+		if (workloops[i].kq == 0) { workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = id; return workloops[i].kq; }
+	}
+	return -1;
+}
+// Recoge sin esperar los eventos pendientes de un workloop (kevent_qos_s de 72 bytes). Devuelve cuántos.
+long kq_drain(uint64_t id, uint64_t evp, int max) {
+	int kq = kq_workloop_fd(id);
+	return kq < 0 ? 0 : do_kevent(kq, 2, 0, 0, evp, max, 0);
+}
 static long bsd_kevent_id(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
-	int kq = -1;
-	for (int i = 0; i < 64; i++) {
-		if (workloops[i].kq > 0 && workloops[i].id == c->a[0]) { kq = workloops[i].kq; break; }
-		if (workloops[i].kq == 0) { kq = workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = c->a[0]; break; }
-	}
+	int kq = kq_workloop_fd(c->a[0]);
 	if (kq < 0) return -D_ENOMEM;
 	wq_note_workloop(c->a[0]);
 	return do_kevent(kq, 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);

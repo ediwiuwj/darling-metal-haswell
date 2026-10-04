@@ -422,7 +422,10 @@ static long bsd_exit(struct ctx* c)  { _exit((int)c->a[0]); }
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
-	long r = syscall(SYS_write, c->a[0], c->a[1], c->a[2]);
+	// TAHOE_FD2LOG: lo que el programa escribe en stdout/stderr (p. ej. os_log con OS_ACTIVITY_DT_MODE) va al registro.
+	static int fd2log = -1;
+	if (fd2log < 0) fd2log = getenv("TAHOE_FD2LOG") != NULL;
+	long r = syscall(SYS_write, (fd2log && (c->a[0] == 1 || c->a[0] == 2)) ? (unsigned long)logfd : c->a[0], c->a[1], c->a[2]);
 	return r < 0 ? -darwin_errno(errno) : r;
 }
 static long bsd_read(struct ctx* c) {
@@ -767,6 +770,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_mach_init();
 	emu_proc_init();
 	emu_kqueue_init();
+	emu_port_init();
 	emu_sem_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {

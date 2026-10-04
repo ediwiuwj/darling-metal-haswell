@@ -215,6 +215,42 @@ static size_t mig_clock_get_time(const struct hdr* req, uint8_t* r) {
 }
 
 // ---------------------------------------------------------------- mach_msg2
+// Recepción desde un puerto de usuario: saca el mensaje, ajusta la cabecera como lo hace el kernel (el puerto de
+// destino pasa a ser "local" y el de respuesta "remoto", con las disposiciones convertidas) y añade el trailer pedido.
+static uint32_t rx_disp(uint32_t tx) {
+	switch (tx) {
+	case 17: case 19: case 20: return 17;        // MOVE_SEND / COPY_SEND / MAKE_SEND -> PORT_SEND
+	case 18: case 21: return 18;                 // MOVE_SEND_ONCE / MAKE_SEND_ONCE -> PORT_SEND_ONCE
+	default: return tx;
+	}
+}
+static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
+	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
+	uint8_t* m; uint32_t size;
+	int r = port_receive(rcv_name, timeout, &m, &size);
+	if (r) return r;
+	struct hdr h;
+	memcpy(&h, m, sizeof h);
+	uint32_t txr = h.bits & 0xff, txl = (h.bits >> 8) & 0xff;
+	uint32_t nb = (h.bits & ~0x1f1fu & ~0xffu) | (txl ? rx_disp(txl) : 0) | ((txr ? 16u : 0) << 8);
+	uint32_t remote = h.local, local = h.remote;
+	h.bits = nb; h.remote = remote; h.local = local;
+	memcpy(m, &h, sizeof h);
+	uint32_t elems = (uint32_t)(options >> 24) & 0xf, tsize = elems == 0 ? 8 : elems == 1 ? 12 : elems == 2 ? 20 : elems == 3 ? 52 : 68;
+	uint8_t tr[68] = { 0 };
+	uint32_t seq = 0, uid = geteuid(), gid = getegid(), at[8] = { (uint32_t)-1, geteuid(), getegid(), getuid(), getgid(), (uint32_t)getpid(), 0, 1 };
+	memcpy(tr + 4, &tsize, 4);
+	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
+	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
+	if (tsize >= 52) memcpy(tr + 20, at, 32);
+	long res = 0;
+	if (size + 8 > rcvsize && size + tsize > rcvsize) res = 0x10004004;     // MACH_RCV_TOO_LARGE
+	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = 0x10004003;
+	if (trace_all) logf_("    mach_msg2: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
+	free(m);
+	return res;
+}
+
 static long mach_msg2(struct ctx* c) {
 	uint64_t options = c->a[1];
 	uint64_t buf = c->a[0];
@@ -222,6 +258,8 @@ static long mach_msg2(struct ctx* c) {
 	uint32_t rcvsize = (uint32_t)ctx_arg(c, 6);
 
 	uint8_t req[1024], rep[1024];
+	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
+	if (!(options & 1) && (options & 2)) return user_receive(c, options, buf, rcv_name, rcvsize);
 	if (ssize < sizeof(struct hdr) || ssize > sizeof req || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
 		return 0x10000003;                                      // MACH_SEND_INVALID_DATA
@@ -235,6 +273,12 @@ static long mach_msg2(struct ctx* c) {
 	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
+	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
+		memcpy(req, &h, sizeof h);
+		port_send(h.remote, req, ssize);
+		if (trace_all) logf_("    mach_msg2: envía a 0x%x id=%d (%u bytes)\n", h.remote, h.id, ssize);
+		return (options & 2) ? user_receive(c, options, buf, rcv_name, rcvsize) : MACH_MSG_SUCCESS;
+	}
 	size_t n;
 	switch (h.id) {
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
