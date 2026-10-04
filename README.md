@@ -308,7 +308,7 @@ Qué se vio, por orden:
 **Pendiente, por orden de utilidad**
 1. **`fork` con continuación en el hijo**: el hijo reinicializa `libSystem` y aborta (ver "Problema abierto").
    Siguiente prueba: trazar el hijo instrucción a instrucción desde el retorno del `fork`.
-2. **Re-extraer el recovery con `hfsfuse`** (AUR): 63 de 347 programas estándar y 10.626 archivos salen vacíos con `7z`.
+2. **Re-extracción con `hfsfuse`: hecha** (`tools/dmg2raw.py` convierte el UDIF a imagen cruda; se corta la partición HFS+ con `dd` y se monta con `hfsfuse --force -o ro`). Con 7z salían vacíos 10.624 archivos (9.564 con datos comprimidos y 1.005 enlaces simbólicos); ya están restaurados. `com.apple.cmio.registerassistantservice` falla con `exit(78)` porque su ejecutable no existe en la imagen (igual que en un Mac real).
 3. **`launchd` como PID 1 — arranca y sus demonios corren**: el `launchd` de macOS 26 (BaseSystem) completa su arranque,
    carga ~170 LaunchDaemons y lanza servicios con `posix_spawn` → `xpcproxy` → `execve`: **unos 30 demonios reales de
    macOS 26 quedan en ejecución** como procesos Linux (`syslogd`, `securityd`, `opendirectoryd`, `bluetoothd`,
@@ -327,3 +327,10 @@ Qué se vio, por orden:
 `/proc/self/mem` en lugar de `process_vm_*`; la caché necesita *slide* v2 y región dinámica; `llvm-objdump` no
 desensambla bytes sueltos, usar `objdump -D -b binary -m i386:x86-64`; `ipsw dyld a2s` simboliza direcciones de
 la caché x86_64.
+
+
+### Estado de `launchctl` (abierto)
+`launchctl` se cuelga: `bootstrap_look_up3` hace dos intercambios de entitlements con `launchd` y después `libsystem_notify`
+envía un mensaje de 24 bytes con id `0x3ff` (1023) a un puerto que `launchd` creó por proceso (`flags=0x437`, contexto = pid)
+y nadie recibe. Lo esperable es que el puerto de `com.apple.system.notification_center` sea el que `notifyd` crea con
+`MPO_SERVICE_PORT` (`flags=0x1033`) y registra en `launchd`; hoy la búsqueda devuelve otro puerto. Pendiente de investigar.

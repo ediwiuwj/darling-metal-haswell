@@ -276,7 +276,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			return 0;
 		}
 		waited = 1;
-		if (trace_all) logf_("    mach_msg: espera mensaje en 0x%x (plazo %d ms)\n", name, timeout_ms);
+		if (trace_all) logf_("    mach_msg: <%d> espera mensaje en 0x%x (plazo %d ms)\n", (int)getpid(), name, timeout_ms);
 		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&shm->cv, &shm->lk, &dl) : pthread_cond_wait(&shm->cv, &shm->lk);
 		if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
 		else if (r) { unlock(); return MACH_RCV_TIMED_OUT; }
@@ -349,7 +349,7 @@ static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
 	uint32_t n = port_create(flags & 8 /* MPO_PORTSET */);
-	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u contexto=0x%lx\n", n, opt[0], opt[1], c->a[2]); }
+	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u opt2=0x%x opt3=0x%x contexto=0x%lx\n", n, opt[0], opt[1], opt[2], opt[3], c->a[2]); }
 	return safe_write(c->a[3], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 static long t_destruct(struct ctx* c) {
