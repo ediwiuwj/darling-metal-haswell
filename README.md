@@ -161,7 +161,28 @@ Errores propios que costaron encontrar, por si ayudan a otros:
 - Constantes de `getattrlist` mal copiadas (`0x08000000` es `FULLPATH`, no los flags de protección).
 - `libpthread` aborta con `BUG IN LIBPTHREAD: Token from the kernel is 0` si falta `ptr_munge=`.
 
-Programas probados con éxito (`exit=0`): `ls`, `ls -l`, `echo`, `cat`, `uname -a`, `pwd`.
+Programas probados con éxito (`exit=0`): `ls`, `ls -l`, `echo`, `cat`, `uname -a`, `pwd` y `bash` 3.2.57 con órdenes
+internas (`echo`, aritmética `$((6*7))`, variables). También funciona el `execve` (se relanza `tahoe-run` con el programa
+nuevo e interpreta `#!`) cuando `bash` lanza directamente una única orden externa.
+
+**Problema abierto: `fork`.** `bash -c 'a; b'` o una tubería hacen `fork` y el hijo aborta con `SIGABRT` justo al
+terminar la reinicialización de `libSystem` en el hijo. Lo averiguado:
+- El kernel de Linux **no hereda** `PR_SET_SYSCALL_USER_DISPATCH` en el hijo de un `fork`; sin reactivarlo con
+  `prctl`, las syscalls del hijo se ejecutan como syscalls reales de Linux y devuelven `ENOSYS` en silencio (así es
+  como `libmalloc` acababa escribiendo en una página de solo lectura). Esto está corregido (`reenable_dispatch`).
+- Con eso el hijo ya ejecuta todo el reinicio (`task_self_trap`, `bsdthread_register`, `mprotect`, `host_self_trap`,
+  `mach_port_construct`, `host_get_clock_service`), pero después aborta. No es `bsdthread_ctl` (ya aceptado: lo llama la
+  propia `pthread_kill`), ni el tamaño de recepción, ni el valor de retorno del `fork`.
+- El mensaje de aborto no está en la anotación de crash de `libpthread`, y la pila en ese instante no conserva
+  direcciones de retorno útiles. Falta saber qué función decide abortar; la siguiente prueba razonable es trazar la
+  ejecución del hijo instrucción a instrucción desde el retorno del `fork`.
+
+Otros descubrimientos de esta etapa:
+- `mach_msg2` con `MACH64_SEND_KOBJECT_CALL` no lleva vector: el mensaje completo está en `data` y la respuesta se
+  escribe en el mismo búfer. En mensajes a puertos normales la cabecera viaja solo en registros.
+- Los argumentos 7 y 8 de una syscall van en la pila en `[rsp+8]` y `[rsp+16]`, pero en la ruta de reinicio del hijo
+  ese tamaño de recepción no es fiable; para llamadas a objetos del kernel se usa el tamaño de la respuesta.
+- `process_vm_readv/writev` sobre el propio proceso falla con `EINVAL`: se usa `/proc/self/mem`.
 
 Limitación conocida: 63 de los 347 programas de `/bin`, `/usr/bin`, `/sbin` y `/usr/sbin` (y 10.626 archivos en
 total) están **vacíos** en el sistema extraído, porque `7z` no entiende la compresión transparente de HFS+

@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/sysinfo.h>
@@ -216,19 +217,27 @@ static long mach_msg2(struct ctx* c) {
 	}
 	struct hdr h;
 	memcpy(&h, req, sizeof h);
+	// La cabecera de verdad viaja en registros (bits/tamaño, destino/local, voucher/id). Con SEND_KOBJECT_CALL el
+	// búfer la repite; en mensajes a puertos normales el búfer puede no contenerla.
+	uint64_t bs = c->a[2], rl = c->a[3], vi = c->a[4];
+	h.bits = (uint32_t)bs; h.size = (uint32_t)(bs >> 32);
+	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
+	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
+	int kobject = (options & 0x200000000ULL) != 0;
 	size_t n;
 	switch (h.id) {
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 3418: n = mig_semaphore_create(&h, req, rep); break;
+	case 3403: n = reply_begin(rep, &h, KERN_SUCCESS_); break;     // mach_ports_register: sin efecto
 	case 8000: case 8001: n = mig_task_restartable_register(&h, rep); break;   // register y synchronize
 	case 3409: n = mig_task_get_special_port(&h, req, rep); break;
 	case 3410: n = mig_task_set_special_port(&h, rep); break;
 	case 3405: n = mig_task_info(&h, req, rep); break;
 	default:
-		logf_("    mach_msg2: id=%d destino=0x%x (%u bytes, desc=%u) sin implementar -> MIG_BAD_ID\n", h.id, h.remote, ssize,
-		      h.bits & 0x80000000u ? *(uint32_t*)(req + 24) : 0);
+		logf_("    mach_msg2: opciones=0x%lx %s id=%d destino=0x%x local=0x%x (%u bytes, bits=0x%x) sin implementar -> MIG_BAD_ID\n",
+		      options, kobject ? "kobject" : "puerto", h.id, h.remote, h.local, ssize, h.bits);
 		hexdump(req, ssize < 128 ? ssize : 128);
 		n = reply_begin(rep, &h, MIG_BAD_ID);
 		break;
@@ -240,8 +249,14 @@ static long mach_msg2(struct ctx* c) {
 	memset(rep + n, 0, 8);                                      // trailer: tipo 0, tamaño 8
 	uint32_t tsize = 8;
 	memcpy(rep + n + 4, &tsize, 4);
+	if (kobject && rcvsize < 16) {
+		// En algunas ramas (reinicialización tras fork) el tamaño de recepción de la pila no es fiable. Un cliente MIG
+		// reserva un búfer del tamaño de la respuesta + trailer, y nuestras respuestas tienen el tamaño real.
+		if (trace_all) logf_("    mach_msg2: rcv_size=%u no fiable; se usa el tamaño de la respuesta (%zu+8)\n", rcvsize, n);
+		rcvsize = (uint32_t)(n + 8);
+	}
 	if (n + 8 > rcvsize) {
-		logf_("    mach_msg2: la respuesta (%zu+8) no cabe en rcv_size=%u\n", n, rcvsize);
+		logf_("    mach_msg2: la respuesta (%zu+8) no cabe en rcv_size=%u (id=%d destino=0x%x)\n", n, rcvsize, h.id, h.remote);
 		return MACH_RCV_TOO_LARGE;
 	}
 	if (safe_write(buf, rep, n + 8) != (ssize_t)(n + 8)) return 0x10004003;   // MACH_RCV_INVALID_DATA

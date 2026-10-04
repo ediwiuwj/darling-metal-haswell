@@ -132,6 +132,7 @@ int safe_string(uint64_t addr, char* out, size_t max) {
 }
 const char* tahoe_root;
 char cache_guest_path[1024];
+const char *g_cache_path, *g_dyld_path, *g_self_exe;
 uint64_t cache_ino;   // TAHOE_ROOT: raíz del sistema de archivos de macOS 26 (el recovery extraído)
 
 static void strlcpy_(char* d, const char* s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; if (n) d[i] = 0; }
@@ -598,7 +599,7 @@ void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num]
 static char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
 
 static void log_call(const char* kind, uint32_t num, const char* name, struct ctx* c, const char* verdict) {
-	logf_("  [%s] %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
+	logf_("  [%s] <%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
 }
 
 static void on_sigsys(int sig, siginfo_t* si, void* v) {
@@ -617,7 +618,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
 		if (trace_all || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
 		if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
-		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; }
+		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
 	} else if (cls == 1) {                                       // trampa Mach
 		const char* name = num < MACH_NAMES_N ? mach_names[num] : NULL;
 		if (num < MACH_NAMES_N && mach_table[num]) {
@@ -646,6 +647,13 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 // rt_sigreturn debe ejecutarse desde la región exenta: restaurador propio
 __asm__(".text\n.global tahoe_restorer\n.type tahoe_restorer,@function\ntahoe_restorer:\n\tmovq $15, %rax\n\tsyscall\n\t.size tahoe_restorer, .-tahoe_restorer\n");
 extern void tahoe_restorer(void);
+
+// Linux NO hereda el syscall user dispatch en el hijo de un fork: sin esto, las syscalls de macOS del hijo se
+// ejecutarían como syscalls reales de Linux y devolverían ENOSYS sin pasar por el manejador.
+void reenable_dispatch(void) {
+	if (prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, (unsigned long)tahoe_restorer, 16, &selector) != 0)
+		DIE("hijo: no puedo reactivar PR_SET_SYSCALL_USER_DISPATCH: %s", strerror(errno));
+}
 
 static void install_dispatch(void) {
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
@@ -684,6 +692,13 @@ int main(int argc, char** argv, char** envp) {
 	tahoe_root = getenv("TAHOE_ROOT");
 	trace_all = getenv("TAHOE_TRACE") != NULL;
 	const char *cache = argv[1], *dyld = argv[2], *exe = argv[3];
+	g_cache_path = cache; g_dyld_path = dyld;
+	static char self[4096];
+	ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
+	g_self_exe = sl > 0 ? (self[sl] = 0, self) : argv[0];
+	// execve relanza tahoe-run: TAHOE_ARGV0 permite que argv[0] del programa no sea su ruta
+	const char* argv0 = getenv("TAHOE_ARGV0");
+	if (argv0) { argv[3] = (char*)argv0; unsetenv("TAHOE_ARGV0"); }
 	map_cache(cache);
 	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
 	setup_commpage();
