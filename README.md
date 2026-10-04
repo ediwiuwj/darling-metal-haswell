@@ -128,6 +128,22 @@ emulación como ELF dentro de `mldr`, (B) cargar la emulación como una imagen M
 (C) escribir una emulación nueva solo para lo que Tahoe llama. Y además `commpage` con el diseño de macOS 26,
 las 18 syscalls y 10 trampas Mach que faltan y `SkyLight`.
 
+### `tahoe-run`: un lanzador propio que ejecuta el `dyld` de macOS 26 sobre Linux
+
+Código propio en C (`tahoe-run/`), sin código de Darling. Hace de "kernel" para un programa de Tahoe:
+mapea la caché de librerías (con el *slide* v2 aplicado y la región dinámica), fabrica el `commpage`,
+carga el `dyld` y el programa, monta la pila `[mh][argc][argv][envp][apple]` e intercepta las syscalls con
+`PR_SET_SYSCALL_USER_DISPATCH`. Cada syscall que falta se registra con su nombre.
+
+Resultado con `ls` de macOS 26 (4 de octubre de 2026):
+- El `dyld` auténtico de Tahoe arranca, encuentra la caché y **se desmapea para seguir desde la copia
+  de la caché**; después ejecuta el inicializador de `libSystem`. Es la prueba de que el diseño funciona.
+- Errores míos que costaron encontrar: un `jmp *%r14` justo después de poner `r14` a cero; no crear la
+  región dinámica de la caché (`dyld_data    v3`, que en macOS construye `launchd`); y no aplicar el
+  *slide* de los punteros de datos (aparecían como `0x400003a93d0` en vez de direcciones reales).
+- Siguiente capa: `sysctl` (`kern.bootargs`...), `__mac_syscall`, `fcntl` y `mach_msg2` (trampa 47) hacia el
+  puerto de la tarea. Esa última es la entrada de toda la emulación de Mach IPC.
+
 ### Compilar Darling en un Codespace
 
 `tools/build_darling_codespace.sh` compila `mldr` (el cargador Mach-O) y `darlingserver` en un

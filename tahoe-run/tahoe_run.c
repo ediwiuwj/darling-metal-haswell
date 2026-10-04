@@ -1,0 +1,656 @@
+// tahoe-run: lanza un programa de macOS 26 (x86_64) sobre el kernel de Linux, haciendo de "kernel".
+//
+// Hace lo que XNU hace al ejecutar un proceso:
+//   1. mapea la dyld_shared_cache en sus direcciones fijas (la "shared region"),
+//   2. fabrica el commpage de macOS 26,
+//   3. carga el dyld de Tahoe y el programa (Mach-O) y monta la pila [mh][argc][argv][envp][apple],
+//   4. intercepta las syscalls (PR_SET_SYSCALL_USER_DISPATCH) y las emula en un manejador de SIGSYS.
+//
+// Uso: tahoe-run <dyld_shared_cache_x86_64> <dyld> <programa> [args...]
+// Variables: TAHOE_TRACE=1 registra todas las syscalls; por defecto solo las no implementadas.
+//
+// Hito actual: arrancar dyld y ver qué pide. Todo el código es propio (sin código de Darling).
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <linux/prctl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/personality.h>
+#include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include "sysnames.h"
+
+#ifndef SYS_USER_DISPATCH
+#define SYS_USER_DISPATCH 2
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+#define CACHE_BASE   0x00007ff800000000UL
+#define COMMPAGE     0x00007fffffe00000UL
+#define DYLD_SLIDE   0x00007ffc00000000UL
+#define STACK_TOP    0x00007ff7bff00000UL
+#define STACK_SIZE   (8UL << 20)
+#define PAGE         4096UL
+
+static int trace_all;
+
+// ---------------------------------------------------------------- utilidades
+static void logf_(const char* fmt, ...) {
+	char buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(buf, sizeof buf, fmt, ap);
+	va_end(ap);
+	if (n > 0) {
+		ssize_t r = write(2, buf, n < (int)sizeof buf ? n : (int)sizeof buf - 1);
+		(void)r;
+	}
+}
+#define LOG(...) logf_("tahoe-run: " __VA_ARGS__)
+#define DIE(...) do { LOG(__VA_ARGS__); logf_("\n"); _exit(111); } while (0)
+
+static uint64_t round_up(uint64_t v) { return (v + PAGE - 1) & ~(PAGE - 1); }
+
+// ---------------------------------------------------------------- errno de Linux -> Darwin
+static int darwin_errno(int e) {
+	if (e >= 1 && e <= 34 && e != EAGAIN) return e;  // coinciden hasta ERANGE, salvo EAGAIN
+	switch (e) {
+	case EAGAIN: return 35;        case EINPROGRESS: return 36;   case EALREADY: return 37;
+	case ENOTSOCK: return 38;      case EDESTADDRREQ: return 39;  case EMSGSIZE: return 40;
+	case EPROTOTYPE: return 41;    case ENOPROTOOPT: return 42;   case EPROTONOSUPPORT: return 43;
+	case EOPNOTSUPP: return 102;   case EAFNOSUPPORT: return 47;  case EADDRINUSE: return 48;
+	case EADDRNOTAVAIL: return 49; case ENETDOWN: return 50;      case ENETUNREACH: return 51;
+	case ECONNABORTED: return 53;  case ECONNRESET: return 54;    case ENOBUFS: return 55;
+	case EISCONN: return 56;       case ENOTCONN: return 57;      case ETIMEDOUT: return 60;
+	case ECONNREFUSED: return 61;  case ELOOP: return 62;         case ENAMETOOLONG: return 63;
+	case EHOSTUNREACH: return 65;  case ENOTEMPTY: return 66;     case EDQUOT: return 69;
+	case ESTALE: return 70;        case ENOLCK: return 77;        case ENOSYS: return 78;
+	case EOVERFLOW: return 84;     case ECANCELED: return 89;     case EIDRM: return 90;
+	case ENOMSG: return 91;        case EILSEQ: return 92;        case EBADMSG: return 94;
+	case EDEADLK: return 11;
+	default: return e;
+	}
+}
+enum { DARWIN_ENOSYS = 78, DARWIN_EINVAL = 22, DARWIN_EBADF = 9, DARWIN_ENOENT = 2 };
+
+
+// ---------------------------------------------------------------- lectura segura de la memoria del programa
+// Un puntero erróneo del programa no debe tumbar al lanzador: se copia con process_vm_readv.
+static ssize_t safe_read(uint64_t addr, void* buf, size_t len) {
+	struct iovec l = { buf, len }, r = { (void*)addr, len };
+	return syscall(SYS_process_vm_readv, getpid(), &l, 1, &r, 1, 0);
+}
+static int safe_string(uint64_t addr, char* out, size_t max) {
+	if (!addr) { out[0] = 0; return -1; }
+	size_t n = 0;
+	while (n + 1 < max) {
+		char ch;
+		if (safe_read(addr + n, &ch, 1) != 1) { out[n] = 0; return n ? 0 : -1; }
+		out[n++] = ch;
+		if (!ch) return 0;
+	}
+	out[n] = 0;
+	return 0;
+}
+static const char* tahoe_root;   // TAHOE_ROOT: raíz del sistema de archivos de macOS 26 (el recovery extraído)
+
+static void strlcpy_(char* d, const char* s, size_t n) { size_t i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; if (n) d[i] = 0; }
+
+// ---------------------------------------------------------------- shared region (caché)
+static char** g_argv;
+extern char** environ;
+
+// ---------------------------------------------------------------- slide de la caché (formato v2)
+// Los punteros de __DATA/__DATA_CONST se guardan codificados: el kernel los convierte en punteros reales al
+// mapear la caché, incluso con slide 0. Es dyld_cache_slide_info2 (common/DyldSharedCache.cpp, rebaseChainV2).
+struct slide_info2 {
+	uint32_t version, page_size, page_starts_offset, page_starts_count, page_extras_offset, page_extras_count;
+	uint64_t delta_mask, value_add;
+};
+static void rebase_chain_v2(uint8_t* page, uint32_t start, uint64_t slide, const struct slide_info2* si) {
+	const uint64_t delta_mask = si->delta_mask, value_mask = ~delta_mask;
+	const unsigned delta_shift = __builtin_ctzll(delta_mask) - 2;
+	uint32_t off = start, delta = 1;
+	while (delta != 0) {
+		uint64_t* loc = (uint64_t*)(page + off);
+		uint64_t raw = *loc;
+		delta = (uint32_t)((raw & delta_mask) >> delta_shift);
+		uint64_t value = raw & value_mask;
+		if (value != 0) value += si->value_add + slide;
+		*loc = value;
+		off += delta;
+	}
+}
+static void apply_slide_v2(uint8_t* data, const struct slide_info2* si, uint64_t slide) {
+	const uint16_t* starts = (const uint16_t*)((const uint8_t*)si + si->page_starts_offset);
+	const uint16_t* extras = (const uint16_t*)((const uint8_t*)si + si->page_extras_offset);
+	for (uint32_t i = 0; i < si->page_starts_count; i++) {
+		uint8_t* page = data + (uint64_t)si->page_size * i;
+		uint16_t entry = starts[i];
+		if (entry == 0x4000) continue;                                   // sin rebase
+		if (entry & 0x8000) {                                            // varias cadenas en esta página
+			uint16_t idx = entry & 0x3FFF;
+			for (int done = 0; !done; idx++) {
+				uint16_t info = extras[idx];
+				rebase_chain_v2(page, (info & 0x3FFF) * 4, slide, si);
+				done = info & 0x8000;
+			}
+		} else {
+			rebase_chain_v2(page, entry * 4, slide, si);
+		}
+	}
+}
+static void apply_cache_slide(int fd, const char* path) {
+	uint32_t off, cnt;
+	if (pread(fd, &off, 4, 0x138) != 4 || pread(fd, &cnt, 4, 0x13c) != 4 || !off || !cnt || cnt > 16) return;
+	struct { uint64_t address, size, fileoff, slide_off, slide_size, flags; uint32_t maxprot, initprot; } m[16];
+	if (pread(fd, m, cnt * sizeof m[0], off) != (ssize_t)(cnt * sizeof m[0])) return;
+	for (uint32_t i = 0; i < cnt; i++) {
+		if (!m[i].slide_size) continue;
+		struct slide_info2* si = malloc(m[i].slide_size);
+		if (pread(fd, si, m[i].slide_size, m[i].slide_off) != (ssize_t)m[i].slide_size) DIE("slide info ilegible en %s", path);
+		if (si->version != 2) DIE("%s: versión de slide info %u no soportada (solo v2)", path, si->version);
+		mprotect((void*)m[i].address, m[i].size, PROT_READ | PROT_WRITE);
+		apply_slide_v2((uint8_t*)m[i].address, si, 0);
+		mprotect((void*)m[i].address, m[i].size, m[i].initprot & 7);
+		free(si);
+	}
+}
+
+static void map_one(const char* path) {
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
+	uint8_t h[0x20];
+	if (pread(fd, h, sizeof h, 0) != sizeof h || memcmp(h, "dyld_v1", 7) != 0) DIE("%s no es una dyld_shared_cache", path);
+	uint32_t off = *(uint32_t*)(h + 0x10), cnt = *(uint32_t*)(h + 0x14);
+	struct { uint64_t addr, size, fileoff; uint32_t maxprot, initprot; } m[16];
+	if (cnt > 16 || pread(fd, m, cnt * sizeof m[0], off) != (ssize_t)(cnt * sizeof m[0])) DIE("tabla de mapeos ilegible en %s", path);
+	for (uint32_t i = 0; i < cnt; i++) {
+		void* p = mmap((void*)m[i].addr, m[i].size, m[i].initprot, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, m[i].fileoff);
+		if (p == MAP_FAILED) {
+			if (errno == EEXIST && !getenv("TAHOE_REEXEC")) {
+				// algo del proceso ya ocupa esa dirección (ASLR): reintentar sin aleatorización
+				setenv("TAHOE_REEXEC", "1", 1);
+				personality(personality(0xffffffff) | ADDR_NO_RANDOMIZE);
+				execve("/proc/self/exe", g_argv, environ);
+			}
+			DIE("mmap de la caché falló en 0x%lx (+0x%lx): %s", m[i].addr, m[i].size, strerror(errno));
+		}
+	}
+	apply_cache_slide(fd, path);
+	close(fd);
+}
+
+// La "región dinámica" de la caché la construye launchd en macOS y la copia shared_region_map_and_slide_2_np.
+// Diseño (DyldSharedCache::DynamicRegion, versión 3): marca, FileIdTuple, desplazamientos de rutas, flags.
+static void map_dynamic_region(const char* main_path) {
+	uint64_t off, maxsize;
+	int fd = open(main_path, O_RDONLY);
+	if (fd < 0 || pread(fd, &off, 8, 0x1f0) != 8 || pread(fd, &maxsize, 8, 0x1f8) != 8) DIE("no puedo leer dynamicDataOffset de la cabecera");
+	struct stat st;
+	fstat(fd, &st);
+	close(fd);
+	if (!off || !maxsize) return;
+	uint8_t* p = mmap((void*)(CACHE_BASE + off), maxsize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED) DIE("región dinámica en 0x%lx: %s", CACHE_BASE + off, strerror(errno));
+	memcpy(p, "dyld_data    v3", 16);
+	*(uint64_t*)(p + 16) = (uint64_t)st.st_dev;                   // fsid
+	*(uint64_t*)(p + 24) = (uint64_t)st.st_ino;                   // fsobjid
+	*(uint32_t*)(p + 32) = 0;                                     // _osCryptexPathOffset: sin cryptex
+	*(uint32_t*)(p + 36) = 80;                                    // _cachePathOffset = sizeof(DynamicRegion)
+	strlcpy_((char*)p + 80, main_path, maxsize - 80);
+	mprotect(p, maxsize, PROT_READ);
+}
+
+static void map_cache(const char* main_path) {
+	map_one(main_path);
+	map_dynamic_region(main_path);
+	glob_t g;
+	char pat[4096];
+	snprintf(pat, sizeof pat, "%s.[0-9]*", main_path);
+	if (glob(pat, 0, NULL, &g) == 0) {
+		for (size_t i = 0; i < g.gl_pathc; i++) map_one(g.gl_pathv[i]);
+		globfree(&g);
+	}
+}
+
+// ---------------------------------------------------------------- commpage (macOS 26, x86_64)
+// Diseño tomado de osfmk/i386/cpu_capabilities.h de XNU 12377.
+static uint64_t tsc_hz_estimate(void) {
+	struct timespec a, b;
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	uint64_t t0 = __builtin_ia32_rdtsc();
+	do { clock_gettime(CLOCK_MONOTONIC, &b); } while ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < 30000000L);
+	uint64_t t1 = __builtin_ia32_rdtsc();
+	uint64_t ns = (b.tv_sec - a.tv_sec) * 1000000000UL + (b.tv_nsec - a.tv_nsec);
+	return (t1 - t0) * 1000000000UL / ns;
+}
+
+static void setup_commpage(void) {
+	uint8_t* p = mmap((void*)COMMPAGE, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (p == MAP_FAILED) DIE("no puedo mapear el commpage: %s", strerror(errno));
+	memcpy(p, "commpage 64-bit", 16);
+	uint64_t caps = 0x00000001 | 0x2 | 0x4 | 0x8 | 0x20 /*cache64*/ | 0x100 | 0x1000 /*AES*/ | 0x04000000 | 0x10000000 | 0x40000000 | 0x80000000;
+	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+	caps |= ((uint64_t)ncpu & 0xff) << 16;
+	*(uint64_t*)(p + 0x10) = caps;
+	*(uint16_t*)(p + 0x1E) = 14;                         // _COMM_PAGE_THIS_VERSION
+	*(uint32_t*)(p + 0x20) = (uint32_t)caps;
+	p[0x22] = (uint8_t)ncpu;
+	*(uint16_t*)(p + 0x26) = 64;                         // línea de caché
+	p[0x34] = (uint8_t)ncpu; p[0x35] = (uint8_t)(ncpu > 1 ? ncpu / 2 : 1); p[0x36] = (uint8_t)ncpu;
+	*(uint64_t*)(p + 0x38) = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
+	p[0x4D] = 12; p[0x4E] = 12;                          // desplazamientos de página (4 KiB)
+	// nanotime: ns = ns_base + (((tsc - tsc_base) << shift) * scale >> 32)
+	uint64_t hz = tsc_hz_estimate();
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	*(uint64_t*)(p + 0x50) = __builtin_ia32_rdtsc();
+	*(uint32_t*)(p + 0x58) = (uint32_t)(((unsigned __int128)1000000000UL << 32) / hz);
+	*(uint32_t*)(p + 0x5c) = 0;
+	*(uint64_t*)(p + 0x60) = now.tv_sec * 1000000000UL + now.tv_nsec;
+	*(uint32_t*)(p + 0x68) = 1;                          // generación (distinta de 0 = válido)
+	mprotect(p, PAGE, PROT_READ);
+	LOG("commpage listo (tsc ~ %lu MHz, %ld cpus)\n", hz / 1000000UL, ncpu);
+}
+
+// ---------------------------------------------------------------- cargador Mach-O
+struct macho_hdr { uint32_t magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved; };
+struct lcmd { uint32_t cmd, cmdsize; };
+struct seg64 { uint32_t cmd, cmdsize; char segname[16]; uint64_t vmaddr, vmsize, fileoff, filesize; uint32_t maxprot, initprot, nsects, flags; };
+#define LC_SEGMENT_64 0x19
+#define LC_UNIXTHREAD 0x5
+#define LC_MAIN       0x80000028
+
+struct image { uint64_t mh; uint64_t entry; uint32_t filetype; uint64_t hi; };
+
+static void load_macho(const char* path, uint64_t slide, struct image* out) {
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
+	uint64_t base_off = 0;
+	uint8_t first[8];
+	if (pread(fd, first, 8, 0) != 8) DIE("%s ilegible", path);
+	if (first[0] == 0xca && first[1] == 0xfe && first[2] == 0xba && first[3] == 0xbe) {  // fat
+		uint32_t n = __builtin_bswap32(*(uint32_t*)(first + 4));
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t fa[5];
+			pread(fd, fa, sizeof fa, 8 + 20 * i);
+			if (__builtin_bswap32(fa[0]) == 0x01000007) { base_off = __builtin_bswap32(fa[2]); break; }
+		}
+		if (!base_off) DIE("%s no tiene rebanada x86_64", path);
+	}
+	struct macho_hdr mh;
+	pread(fd, &mh, sizeof mh, base_off);
+	if (mh.magic != 0xfeedfacf || mh.cputype != 0x01000007) DIE("%s no es un Mach-O x86_64", path);
+	uint8_t* cmds = malloc(mh.sizeofcmds);
+	pread(fd, cmds, mh.sizeofcmds, base_off + sizeof mh);
+	out->mh = 0; out->entry = 0; out->filetype = mh.filetype; out->hi = 0;
+	uint64_t entryoff = 0;
+	int have_main = 0;
+	for (uint32_t i = 0, pos = 0; i < mh.ncmds; i++) {
+		struct lcmd* lc = (struct lcmd*)(cmds + pos);
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct seg64* s = (struct seg64*)lc;
+			uint64_t addr = s->vmaddr + slide;
+			if (s->vmsize == 0 || addr < 0x10000) { pos += lc->cmdsize; continue; }   // __PAGEZERO
+			uint64_t maplen = round_up(s->filesize);
+			int prot = s->initprot & 7;
+			if (s->filesize) {
+				void* p = mmap((void*)addr, maplen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, base_off + s->fileoff);
+				if (p == MAP_FAILED) DIE("%s: mmap de %s en 0x%lx falló: %s", path, s->segname, addr, strerror(errno));
+				if (s->vmsize > s->filesize && maplen > s->filesize) memset((void*)(addr + s->filesize), 0, maplen - s->filesize);
+				mprotect((void*)addr, maplen, prot);
+			}
+			if (round_up(s->vmsize) > maplen) {
+				void* p = mmap((void*)(addr + maplen), round_up(s->vmsize) - maplen, prot ? prot : PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+				if (p == MAP_FAILED) DIE("%s: relleno de %s falló: %s", path, s->segname, strerror(errno));
+			}
+			if (s->fileoff == 0 && s->filesize) out->mh = addr;
+			if (addr + s->vmsize > out->hi) out->hi = addr + s->vmsize;
+		} else if (lc->cmd == LC_UNIXTHREAD) {
+			uint32_t* t = (uint32_t*)(lc + 1);                // flavor, count, estado
+			if (t[0] == 4) out->entry = ((uint64_t*)(t + 2))[16] + slide;   // x86_THREAD_STATE64: rip es el registro 16
+		} else if (lc->cmd == LC_MAIN) {
+			entryoff = ((uint64_t*)(lc + 1))[0];
+			have_main = 1;
+		}
+		pos += lc->cmdsize;
+	}
+	if (have_main && out->mh) out->entry = out->mh + entryoff;
+	free(cmds);
+	close(fd);
+	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
+	LOG("cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
+}
+
+// ---------------------------------------------------------------- pila inicial
+static uint64_t build_stack(uint64_t exe_mh, int argc, char** argv, char** envp, const char* exe_path) {
+	uint8_t* lo = mmap((void*)(STACK_TOP - STACK_SIZE), STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (lo == MAP_FAILED) DIE("no puedo mapear la pila: %s", strerror(errno));
+	char apple[2][1100];
+	snprintf(apple[0], sizeof apple[0], "executable_path=%s", exe_path);
+	snprintf(apple[1], sizeof apple[1], "main_stack=0x%lx,0x%lx,0x%lx,0x%lx", STACK_TOP, STACK_SIZE, STACK_TOP - STACK_SIZE, STACK_SIZE);
+	int nenv = 0;
+	while (envp[nenv]) nenv++;
+	// copiar las cadenas al final de la pila
+	uint64_t sp = STACK_TOP - 64;
+	char** av = calloc(argc + 1, sizeof(char*));
+	char** ev = calloc(nenv + 1, sizeof(char*));
+	char* ap[2];
+	for (int i = 1; i >= 0; i--) { sp -= strlen(apple[i]) + 1; memcpy((void*)sp, apple[i], strlen(apple[i]) + 1); ap[i] = (char*)sp; }
+	for (int i = nenv - 1; i >= 0; i--) { sp -= strlen(envp[i]) + 1; memcpy((void*)sp, envp[i], strlen(envp[i]) + 1); ev[i] = (char*)sp; }
+	for (int i = argc - 1; i >= 0; i--) { sp -= strlen(argv[i]) + 1; memcpy((void*)sp, argv[i], strlen(argv[i]) + 1); av[i] = (char*)sp; }
+	sp &= ~15UL;
+	// [mh][argc][argv...][0][envp...][0][apple...][0]
+	size_t words = 1 + 1 + argc + 1 + nenv + 1 + 2 + 1;
+	sp -= words * 8;
+	sp &= ~15UL;
+	uint64_t* w = (uint64_t*)sp;
+	size_t k = 0;
+	w[k++] = exe_mh;
+	w[k++] = argc;
+	for (int i = 0; i < argc; i++) w[k++] = (uint64_t)av[i];
+	w[k++] = 0;
+	for (int i = 0; i < nenv; i++) w[k++] = (uint64_t)ev[i];
+	w[k++] = 0;
+	w[k++] = (uint64_t)ap[0];
+	w[k++] = (uint64_t)ap[1];
+	w[k++] = 0;
+	return sp;
+}
+
+// ---------------------------------------------------------------- emulación de syscalls
+struct ctx { uint64_t nr, a[6]; ucontext_t* uc; };
+typedef long (*bsd_fn)(struct ctx*);
+
+// BSD: devuelven >= 0 o -errno_de_Darwin
+static long bsd_exit(struct ctx* c)  { _exit((int)c->a[0]); }
+static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
+static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
+static long bsd_write(struct ctx* c) {
+	long r = syscall(SYS_write, c->a[0], c->a[1], c->a[2]);
+	return r < 0 ? -darwin_errno(errno) : r;
+}
+static long bsd_read(struct ctx* c) {
+	long r = syscall(SYS_read, c->a[0], c->a[1], c->a[2]);
+	return r < 0 ? -darwin_errno(errno) : r;
+}
+static long bsd_close(struct ctx* c) {
+	long r = syscall(SYS_close, c->a[0]);
+	return r < 0 ? -darwin_errno(errno) : r;
+}
+// flags de open de Darwin -> Linux
+static int darwin_open_flags(int f) {
+	int o = f & 3;                                   // O_RDONLY/O_WRONLY/O_RDWR coinciden
+	if (f & 0x0004) o |= O_NONBLOCK;
+	if (f & 0x0008) o |= O_APPEND;
+	if (f & 0x0040) o |= O_ASYNC;
+	if (f & 0x0080) o |= O_SYNC;
+	if (f & 0x0100) o |= O_NOFOLLOW;
+	if (f & 0x0200) o |= O_CREAT;
+	if (f & 0x0400) o |= O_TRUNC;
+	if (f & 0x0800) o |= O_EXCL;
+	if (f & 0x20000) o |= O_NOCTTY;
+	if (f & 0x100000) o |= O_DIRECTORY;
+	if (f & 0x400000) o |= O_DSYNC;
+	if (f & 0x1000000) o |= O_CLOEXEC;
+	return o;
+}
+static long bsd_open(struct ctx* c) {
+	char path[4096], full[4200];
+	if (safe_string(c->a[0], path, sizeof path) != 0) return -14;          // EFAULT
+	int flags = darwin_open_flags((int)c->a[1]);
+	long fd = -1;
+	if (tahoe_root && path[0] == '/') {
+		snprintf(full, sizeof full, "%s%s", tahoe_root, path);
+		fd = syscall(SYS_open, full, flags, (int)c->a[2]);
+	}
+	if (fd < 0) fd = syscall(SYS_open, path, flags, (int)c->a[2]);
+	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
+	return fd < 0 ? -darwin_errno(errno) : fd;
+}
+static long bsd_getentropy(struct ctx* c) {
+	long r = syscall(SYS_getrandom, c->a[0], c->a[1], 0);
+	return r < 0 ? -darwin_errno(errno) : 0;
+}
+// La máscara de señales es virtual por ahora: aplicarla de verdad podría bloquear SIGSYS (la interceptación).
+static uint32_t virtual_sigmask;
+static long bsd_sigprocmask(struct ctx* c) {
+	uint32_t set = 0, old = virtual_sigmask;
+	if (c->a[1] && safe_read(c->a[1], &set, 4) != 4) return -14;
+	if (c->a[1]) {
+		if (c->a[0] == 1) virtual_sigmask |= set;          // SIG_BLOCK
+		else if (c->a[0] == 2) virtual_sigmask &= ~set;     // SIG_UNBLOCK
+		else if (c->a[0] == 3) virtual_sigmask = set;       // SIG_SETMASK
+		else return -22;
+	}
+	if (c->a[2]) { if (syscall(SYS_process_vm_writev, getpid(), &(struct iovec){ &old, 4 }, 1, &(struct iovec){ (void*)c->a[2], 4 }, 1, 0) != 4) return -14; }
+	return 0;
+}
+static void show_payload(const char* what, uint64_t ns, uint64_t code, uint64_t payload, uint64_t size, uint64_t reason) {
+	char msg[512] = "", pl[600] = "";
+	safe_string(reason, msg, sizeof msg);
+	if (payload && size) {
+		size_t n = size < sizeof pl - 1 ? size : sizeof pl - 1;
+		if (safe_read(payload, pl, n) == (ssize_t)n) { for (size_t i = 0; i < n; i++) if (pl[i] && (pl[i] < 32 || pl[i] > 126)) pl[i] = '.'; pl[n] = 0; }
+		else pl[0] = 0;
+	}
+	logf_("\n  === %s: espacio=%lu codigo=%lu\n  === motivo: \"%s\"\n  === carga: \"%s\"\n", what, ns, code, msg, pl);
+}
+static long bsd_abort_with_payload(struct ctx* c) {
+	show_payload("abort_with_payload", c->a[0], c->a[1], c->a[2], c->a[3], c->a[4]);
+	_exit(134);
+}
+static long bsd_terminate_with_payload(struct ctx* c) {
+	show_payload("terminate_with_payload", c->a[1], c->a[2], c->a[3], c->a[4], c->a[5]);
+	_exit(134);
+}
+// csrctl: consulta de SIP. op 0 = CSR_SYSCALL_CHECK; 0 significa "permitido" (como con SIP desactivado).
+static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
+// proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
+static long bsd_proc_info(struct ctx* c) {
+	if ((int)c->a[0] == 15) return 0;
+	return -DARWIN_EINVAL;
+}
+static long bsd_thread_selfid(struct ctx* c) { (void)c; return syscall(SYS_gettid); }
+static long bsd_shared_region_check_np(struct ctx* c) {
+	// la caché ya está mapeada en su dirección preferida: devolvemos dónde empieza
+	*(uint64_t*)c->a[0] = CACHE_BASE;
+	return 0;
+}
+
+static bsd_fn bsd_table[BSD_NAMES_N] = {
+	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
+	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
+	[5] = bsd_open, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+};
+
+
+// ---------------------------------------------------------------- trampas Mach (primera versión)
+// Los nombres de puerto son solo identificadores: lo que importa es que sean estables y distintos de cero.
+#define PORT_TASK_SELF   0x103
+#define PORT_THREAD_SELF 0x203
+#define PORT_HOST_SELF   0x303
+static uint32_t next_port = 0x1103;
+enum { KERN_SUCCESS_ = 0, KERN_FAILURE_ = 5 };
+
+typedef long (*mach_fn)(struct ctx*);
+static long mach_task_self_trap(struct ctx* c)   { (void)c; return PORT_TASK_SELF; }
+static long mach_thread_self_trap(struct ctx* c) { (void)c; return PORT_THREAD_SELF; }
+static long mach_host_self_trap(struct ctx* c)   { (void)c; return PORT_HOST_SELF; }
+static long mach_reply_port_trap(struct ctx* c)  { (void)c; uint32_t p = next_port; next_port += 0x100; return p; }
+static long mach_vm_protect_trap(struct ctx* c) {
+	// (target, address, size, set_maximum, new_protection)
+	if (c->a[3]) return KERN_SUCCESS_;                   // cambiar la protección máxima: sin efecto en Linux
+	return mprotect((void*)c->a[1], round_up(c->a[2]), (int)c->a[4] & 7) == 0 ? KERN_SUCCESS_ : 2 /*KERN_PROTECTION_FAILURE*/;
+}
+// escritura segura de un valor de 64 bits en la memoria del programa
+static int safe_write64(uint64_t addr, uint64_t v) {
+	struct iovec l = { &v, 8 }, r = { (void*)addr, 8 };
+	return syscall(SYS_process_vm_writev, getpid(), &l, 1, &r, 1, 0) == 8 ? 0 : -1;
+}
+enum { KERN_INVALID_ADDRESS_ = 1, KERN_NO_SPACE_ = 3, KERN_INVALID_ARGUMENT_ = 4 };
+#define VM_FLAGS_ANYWHERE  0x0001
+#define VM_FLAGS_OVERWRITE 0x4000
+
+// Reserva memoria anónima como mach_vm_allocate / mach_vm_map: *addr es entrada (si FIXED) y salida.
+static long vm_alloc(uint64_t addr_ptr, uint64_t size, int flags, uint64_t mask, int prot) {
+	uint64_t want = 0;
+	if (safe_read(addr_ptr, &want, 8) != 8) return KERN_INVALID_ADDRESS_;
+	if (!size) return KERN_INVALID_ARGUMENT_;
+	size = round_up(size);
+	void* p;
+	if (flags & VM_FLAGS_ANYWHERE) {
+		if (mask > PAGE - 1) {                            // alineación mayor que una página: reservar de más y recortar
+			uint64_t align = mask + 1, total = size + align;
+			uint8_t* q = mmap(NULL, total, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (q == MAP_FAILED) return KERN_NO_SPACE_;
+			uint64_t a = ((uint64_t)q + mask) & ~mask;
+			if (a > (uint64_t)q) munmap(q, a - (uint64_t)q);
+			if ((uint64_t)q + total > a + size) munmap((void*)(a + size), (uint64_t)q + total - (a + size));
+			p = (void*)a;
+		} else {
+			p = mmap(NULL, size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		}
+	} else {
+		int extra = (flags & VM_FLAGS_OVERWRITE) ? MAP_FIXED : MAP_FIXED_NOREPLACE;
+		p = mmap((void*)want, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+	}
+	if (p == MAP_FAILED) return KERN_NO_SPACE_;
+	return safe_write64(addr_ptr, (uint64_t)p) == 0 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
+}
+static long mach_vm_allocate_trap(struct ctx* c)   { return vm_alloc(c->a[1], c->a[2], (int)c->a[3], 0, PROT_READ | PROT_WRITE); }
+static long mach_vm_map_trap(struct ctx* c)        { return vm_alloc(c->a[1], c->a[2], (int)c->a[4], c->a[3], (int)c->a[5] & 7); }
+static long mach_vm_deallocate_trap(struct ctx* c) { return munmap((void*)c->a[1], round_up(c->a[2])) == 0 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_; }
+static long mach_nop_success(struct ctx* c)        { (void)c; return KERN_SUCCESS_; }
+static long mach_timebase_info_trap(struct ctx* c) {
+	uint32_t tb[2] = { 1, 1 };                         // el contador ya está en nanosegundos
+	struct iovec l = { tb, 8 }, r = { (void*)c->a[0], 8 };
+	return syscall(SYS_process_vm_writev, getpid(), &l, 1, &r, 1, 0) == 8 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
+}
+static mach_fn mach_table[MACH_NAMES_N] = {
+	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
+	[18] = mach_nop_success, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
+	[89] = mach_timebase_info_trap,
+	[14] = mach_vm_protect_trap,
+	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
+};
+
+static char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+
+static void log_call(const char* kind, uint32_t num, const char* name, struct ctx* c, const char* verdict) {
+	logf_("  [%s] %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
+}
+
+static void on_sigsys(int sig, siginfo_t* si, void* v) {
+	(void)sig;
+	selector = SYSCALL_DISPATCH_FILTER_ALLOW;   // dentro del manejador, las syscalls van directas a Linux
+	ucontext_t* uc = v;
+	greg_t* g = uc->uc_mcontext.gregs;
+	if (si->si_code != SYS_USER_DISPATCH) DIE("SIGSYS inesperado (si_code=%d) en rip=0x%llx", si->si_code, (unsigned long long)g[REG_RIP]);
+	struct ctx c = { .nr = g[REG_RAX], .a = { g[REG_RDI], g[REG_RSI], g[REG_RDX], g[REG_R10], g[REG_R8], g[REG_R9] }, .uc = uc };
+	uint32_t cls = c.nr >> 24, num = c.nr & 0xffffff;
+	if (cls == 2) {                                              // syscall BSD
+		const char* name = num < BSD_NAMES_N ? bsd_names[num] : NULL;
+		long r;
+		const char* verdict;
+		if (num < BSD_NAMES_N && bsd_table[num]) { r = bsd_table[num](&c); verdict = "ok   "; }
+		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
+		if (trace_all || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
+		if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
+		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; }
+	} else if (cls == 1) {                                       // trampa Mach
+		const char* name = num < MACH_NAMES_N ? mach_names[num] : NULL;
+		if (num < MACH_NAMES_N && mach_table[num]) {
+			g[REG_RAX] = mach_table[num](&c);
+			if (trace_all) log_call("mach", num, name, &c, "ok   ");
+		} else {
+			log_call("mach", num, name, &c, "FALTA");
+			g[REG_RAX] = KERN_FAILURE_;
+		}
+	} else if (cls == 3) {                                       // machdep
+		if (num == 3) {                                          // thread_fast_set_cthread_self: base de GS
+			syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, c.a[0]);
+			g[REG_RAX] = 0;
+			if (trace_all) log_call("machdep", num, "thread_fast_set_cthread_self", &c, "ok   ");
+		} else {
+			log_call("machdep", num, NULL, &c, "FALTA");
+			g[REG_RAX] = 0;
+		}
+	} else {
+		log_call("clase", (uint32_t)c.nr, NULL, &c, "FALTA");
+		g[REG_RAX] = (uint64_t)-1;
+	}
+	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
+}
+
+// rt_sigreturn debe ejecutarse desde la región exenta: restaurador propio
+__asm__(".text\n.global tahoe_restorer\n.type tahoe_restorer,@function\ntahoe_restorer:\n\tmovq $15, %rax\n\tsyscall\n\t.size tahoe_restorer, .-tahoe_restorer\n");
+extern void tahoe_restorer(void);
+
+static void install_dispatch(void) {
+	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
+	if (sigaltstack(&ss, NULL) != 0) DIE("sigaltstack: %s", strerror(errno));
+	struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = {
+		.h = on_sigsys, .flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK | 0x04000000 /*SA_RESTORER*/, .restorer = tahoe_restorer, .mask = 0 };
+	if (syscall(SYS_rt_sigaction, SIGSYS, &ks, NULL, 8) != 0) DIE("rt_sigaction: %s", strerror(errno));
+	if (prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_ON, (unsigned long)tahoe_restorer, 16, &selector) != 0)
+		DIE("PR_SET_SYSCALL_USER_DISPATCH: %s (hace falta Linux >= 5.11)", strerror(errno));
+}
+
+// ---------------------------------------------------------------- main
+// El destino y la pila van por memoria global: ningún registro que se pone a cero puede contener el destino.
+uint64_t g_entry_rip, g_entry_rsp;
+
+static void __attribute__((noreturn)) enter(uint64_t rip, uint64_t rsp) {
+	g_entry_rip = rip;
+	g_entry_rsp = rsp;
+	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
+	__asm__ volatile(
+		"movq g_entry_rsp(%%rip), %%rsp\n\t"
+		"xorl %%eax, %%eax\n\txorl %%ebx, %%ebx\n\txorl %%ecx, %%ecx\n\txorl %%edx, %%edx\n\t"
+		"xorl %%esi, %%esi\n\txorl %%edi, %%edi\n\txorl %%ebp, %%ebp\n\t"
+		"xorl %%r8d, %%r8d\n\txorl %%r9d, %%r9d\n\txorl %%r10d, %%r10d\n\txorl %%r11d, %%r11d\n\t"
+		"xorl %%r12d, %%r12d\n\txorl %%r13d, %%r13d\n\txorl %%r14d, %%r14d\n\txorl %%r15d, %%r15d\n\t"
+		"jmpq *g_entry_rip(%%rip)\n\t" ::: "memory");
+	__builtin_unreachable();
+}
+
+int main(int argc, char** argv, char** envp) {
+	if (argc < 4) {
+		fprintf(stderr, "uso: %s <dyld_shared_cache_x86_64> <dyld> <programa> [args...]\n", argv[0]);
+		return 2;
+	}
+	g_argv = argv;
+	tahoe_root = getenv("TAHOE_ROOT");
+	trace_all = getenv("TAHOE_TRACE") != NULL;
+	const char *cache = argv[1], *dyld = argv[2], *exe = argv[3];
+	map_cache(cache);
+	LOG("caché mapeada en 0x%lx\n", CACHE_BASE);
+	setup_commpage();
+	struct image di, ei;
+	load_macho(dyld, DYLD_SLIDE, &di);
+	load_macho(exe, 0, &ei);
+	if (di.filetype != 7) DIE("%s no es un MH_DYLINKER", dyld);
+	char real[4096];
+	if (!realpath(exe, real)) snprintf(real, sizeof real, "%s", exe);
+	uint64_t sp = build_stack(ei.mh, argc - 3, argv + 3, envp, real);
+	install_dispatch();
+	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
+	enter(di.entry, sp);
+}

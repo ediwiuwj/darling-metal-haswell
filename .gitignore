@@ -9,3 +9,7 @@ target/
 # Python
 __pycache__/
 *.pyc
+
+# tahoe-run
+tahoe-run/tahoe-run
+tahoe-run/sysnames.h
