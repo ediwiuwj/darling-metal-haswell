@@ -323,10 +323,12 @@ static long mach_msg2(struct ctx* c) {
 	uint32_t ssize = (uint32_t)(c->a[2] >> 32);
 	uint32_t rcvsize = (uint32_t)ctx_arg(c, 6);
 
-	uint8_t req[1024], rep[1024];
+	static __thread uint8_t reqbuf[512 * 1024];     // los mensajes entre procesos (listas de servicios...) pueden ser grandes
+	uint8_t* req = reqbuf;
+	uint8_t rep[1024];
 	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
 	if (!(options & 1) && (options & 2)) return user_receive(c, options, buf, rcv_name, rcvsize);
-	if (ssize < sizeof(struct hdr) || ssize > sizeof req || safe_read(buf, req, ssize) != (ssize_t)ssize) {
+	if (ssize < sizeof(struct hdr) || ssize > sizeof reqbuf || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
 		return 0x10000003;                                      // MACH_SEND_INVALID_DATA
 	}
@@ -342,10 +344,13 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		port_send(h.remote, req, ssize);
-		if (h.id == 1023 && ssize == 24 && h.local) {                 // sondeo sin cuerpo con puerto de respuesta (experimento): se contesta vacío
-			struct hdr rh = { .bits = 0x12, .size = 24, .remote = h.local, .local = 0, .voucher = 0, .id = 1123 };
-			uint8_t rb[24]; memcpy(rb, &rh, 24);
-			port_send(h.local, rb, 24);
+		if (h.id >= 1023 && h.id <= 1030 && ssize == 24 && h.local) {   // sondeos de libnotify sin cuerpo: respuesta MIG correcta (NDR + retcode 0)
+			uint8_t rb[36] = { 0 };
+			struct hdr rh = { .bits = 0x12, .size = 36, .remote = h.local, .local = 0, .voucher = 0, .id = h.id + 100 };
+			memcpy(rb, &rh, 24);
+			static const uint8_t ndr[8] = { 0, 0, 0, 0, 1, 0, 0, 0 };
+			memcpy(rb + 24, ndr, 8);
+			port_send(h.local, rb, 36);
 		}
 		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
 		return (options & 2) ? user_receive(c, options, buf, rcv_name, rcvsize) : MACH_MSG_SUCCESS;

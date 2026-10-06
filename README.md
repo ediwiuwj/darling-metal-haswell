@@ -342,8 +342,8 @@ desensambla bytes sueltos, usar `objdump -D -b binary -m i386:x86-64`; `ipsw dyl
 la caché x86_64.
 
 
-### Estado de `launchctl` (abierto)
-`launchctl` se cuelga: `bootstrap_look_up3` hace dos intercambios de entitlements con `launchd` y después `libsystem_notify`
-envía un mensaje de 24 bytes con id `0x3ff` (1023) a un puerto que `launchd` creó por proceso (`flags=0x437`, contexto = pid)
-y nadie recibe. Lo esperable es que el puerto de `com.apple.system.notification_center` sea el que `notifyd` crea con
-`MPO_SERVICE_PORT` (`flags=0x1033`) y registra en `launchd`; hoy la búsqueda devuelve otro puerto. Pendiente de investigar.
+### Estado de `launchctl`
+`launchctl managername` (→ `System`) y `launchctl list` (los servicios reales de `launchd`, con sus PID) **funcionan**. Se arreglaron dos cosas:
+`mach_msg2` truncaba los mensajes de más de 1 KB (la lista de servicios son 12 KB) y `libsystem_notify` bloqueaba al cliente: envía
+un sondeo sin cuerpo (ids 1023-1030) al puerto de `notifyd` y espera respuesta. Hoy esos sondeos se contestan con una respuesta MIG vacía
+(un apaño de `emu_mach.c`, no un `notifyd` de verdad: `notifyd` no llega a atender ese puerto). `launchctl print system` responde "Bad request".
