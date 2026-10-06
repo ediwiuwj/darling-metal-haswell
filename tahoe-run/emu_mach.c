@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <time.h>
+#include <fcntl.h>
 #include "tahoe.h"
 
 #define MACH_MSG_SUCCESS     0
@@ -101,6 +102,33 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 	}
 }
 
+
+// ---- entradas de memoria (mach_make_memory_entry): se respaldan con un archivo en /dev/shm, nombrado por el puerto.
+// El rango del creador se sustituye por una proyección compartida del archivo para que el receptor vea sus escrituras.
+static void me_path(char* b, size_t n, uint32_t port) { snprintf(b, n, "/dev/shm/tahoe-me-%s-%u", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", port); }
+static size_t mig_make_memory_entry(const struct hdr* req, const uint8_t* m, uint8_t* r) {
+	uint64_t size, off;
+	memcpy(&size, m + 48, 8); memcpy(&off, m + 56, 8);
+	uint64_t len = round_up(size);
+	uint32_t port = port_create(0);
+	char path[128]; me_path(path, sizeof path, port);
+	int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	int ok = fd >= 0 && ftruncate(fd, (off_t)len) == 0 && off != 0;
+	if (ok) {
+		uint8_t* tmp = malloc(len);
+		memcpy(tmp, (void*)off, len);                           // lo que ya hubiera escrito el creador
+		if (pwrite(fd, tmp, len, 0) != (ssize_t)len) ok = 0;
+		free(tmp);
+		if (ok && mmap((void*)off, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) ok = 0;
+	}
+	if (fd >= 0) close(fd);
+	if (!ok) return reply_begin(r, req, KERN_INVALID_ARG);
+	size_t n = reply_port(r, req, port, 17);
+	memcpy(r + n, NDR_LE, 8); memcpy(r + n + 8, &len, 8);
+	n += 16;
+	return n;
+}
+
 // ---------------------------------------------------------------- rutinas MIG
 // mach_vm_map (id 4811): cabecera, 1 descriptor de puerto (objeto), NDR, address, size, mask, flags, offset,
 // copy, cur_protection, max_protection, inheritance. Solo se soporta memoria anónima (objeto nulo).
@@ -116,8 +144,16 @@ static size_t mig_mach_vm_map(const struct hdr* req, const uint8_t* m, uint8_t* 
 	memcpy(&flags, m + 72, 4);
 	memcpy(&cur, m + 88, 4);
 	int32_t kr = KERN_SUCCESS_;
-	if (objname) {
-		kr = KERN_INVALID_ARG;                                  // memoria respaldada por un objeto: sin soporte
+	if (objname) {                                          // objeto = entrada de memoria compartida
+		uint64_t moff; memcpy(&moff, m + 76, 8);
+		char path[128]; me_path(path, sizeof path, objname);
+		int fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0) { kr = KERN_INVALID_ARG; goto done; }
+		uint64_t len = round_up(size);
+		void* p = mmap((flags & 1) ? NULL : (void*)addr, len, cur & 7, MAP_SHARED | ((flags & 1) ? 0 : ((flags & 0x4000) ? MAP_FIXED : MAP_FIXED_NOREPLACE)), fd, (off_t)moff);
+		close(fd);
+		if (p == MAP_FAILED) { kr = KERN_NO_SPACE_; goto done; }
+		addr = (uint64_t)p;
 	} else {
 		int prot = cur & 7;
 		uint64_t len = round_up(size);
@@ -403,6 +439,7 @@ static long mach_msg2(struct ctx* c) {
 	switch (h.id) {
 	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
+	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 222: n = reply_port(rep, &h, alloc_port(), 17); break;   // host_create_mach_voucher: puerto de voucher ficticio

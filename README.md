@@ -349,4 +349,4 @@ mueve a un servicio necesita un aviso de despertar propio del nuevo receptor (`p
 los avisos son un nivel (se vacían y se renuevan mientras quede cola: la cola de datagramas de Unix es corta y perdía avisos);
 variables de condición por puerto (antes una global despertaba a todos); y `SIDT`: libdispatch lee de ahí el "número de CPU" (en macOS
 va en el límite de la IDT; en Linux siempre vale 0xfff), así que se reserva el segmento 0xfff de su montón de 32 MiB.
-`launchctl print system` responde "Bad request" (pendiente).
+`launchctl print system` también funciona: `mach_make_memory_entry` se respalda con un archivo en `/dev/shm` que sustituye el rango del creador por una proyección compartida (`mach_vm_map` con objeto la mapea en el receptor).
