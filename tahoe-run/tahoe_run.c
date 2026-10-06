@@ -656,6 +656,8 @@ void reg_mach(unsigned num, emu_fn fn) { if (num < MACH_NAMES_N) mach_table[num]
 
 // Un selector por hilo: cada hilo de macOS es un hilo de Linux y el despacho se activa por hilo.
 static __thread char selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+char tahoe_selector_get(void) { return selector; }
+void tahoe_selector_set(char v) { selector = v; }
 
 static void log_call(const char* kind, uint32_t num, const char* name, struct ctx* c, const char* verdict) {
 	logf_("  [%s] <%d:%d> %s %u %s(0x%lx, 0x%lx, 0x%lx, 0x%lx)\n", verdict, getpid(), (int)(syscall(SYS_gettid) - getpid()), kind, num, name ? name : "?", c->a[0], c->a[1], c->a[2], c->a[3]);
@@ -707,6 +709,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 // rt_sigreturn debe ejecutarse desde la región exenta: restaurador propio
 __asm__(".text\n.global tahoe_restorer\n.type tahoe_restorer,@function\ntahoe_restorer:\n\tmovq $15, %rax\n\tsyscall\n\t.size tahoe_restorer, .-tahoe_restorer\n");
 extern void tahoe_restorer(void);
+void* tahoe_restorer_addr(void) { return (void*)tahoe_restorer; }
 
 // Linux NO hereda el syscall user dispatch en el hijo de un fork: sin esto, las syscalls de macOS del hijo se
 // ejecutarían como syscalls reales de Linux y devolverían ENOSYS sin pasar por el manejador.

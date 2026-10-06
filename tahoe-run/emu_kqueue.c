@@ -5,6 +5,7 @@
 // lleguen a disparar; se registran para saber cuáles hacen falta.
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -42,6 +43,42 @@ static int linux_to_darwin_signal(int s) {
 	default: return s;
 	}
 }
+// ---- señales: un eventfd por señal de Linux, alimentado por un manejador del anfitrión
+static int sig_efd[65];
+static pthread_mutex_t sig_lock = PTHREAD_MUTEX_INITIALIZER;
+extern char tahoe_selector_get(void);
+extern void tahoe_selector_set(char);
+extern void* tahoe_restorer_addr(void);
+// Se ejecuta en cualquier hilo, también mientras corre código de macOS (con el despacho activo): hay que permitir las
+// syscalls reales dentro del manejador y devolver con el restaurador exento.
+static void sig_forward(int sig) {
+	char prev = tahoe_selector_get();
+	tahoe_selector_set(0 /*SYSCALL_DISPATCH_FILTER_ALLOW*/);
+	int e = errno; uint64_t one = 1;
+	if (sig_efd[sig] > 0 && write(sig_efd[sig], &one, 8) < 0) {}
+	errno = e;
+	tahoe_selector_set(prev);
+}
+static int signal_source(int ls) {
+	pthread_mutex_lock(&sig_lock);
+	if (!sig_efd[ls]) {
+		sig_efd[ls] = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+		struct { void* h; unsigned long flags; void* restorer; unsigned long mask; } ks = { (void*)sig_forward, SA_RESTART | SA_ONSTACK | 0x04000000 /*SA_RESTORER*/, tahoe_restorer_addr(), ~0UL };
+		syscall(SYS_rt_sigaction, ls, &ks, NULL, 8);
+	}
+	int fd = sig_efd[ls];
+	pthread_mutex_unlock(&sig_lock);
+	return fd;
+}
+static int darwin_to_linux_sig_k(int d) {
+	switch (d) {
+	case 1: return SIGHUP; case 2: return SIGINT; case 3: return SIGQUIT; case 6: return SIGABRT; case 13: return SIGPIPE; case 14: return SIGALRM;
+	case 15: return SIGTERM; case 16: return SIGURG; case 20: return SIGCHLD; case 21: return SIGTTIN; case 22: return SIGTTOU; case 23: return SIGIO;
+	case 24: return SIGXCPU; case 25: return SIGXFSZ; case 26: return SIGVTALRM; case 27: return SIGPROF; case 28: return SIGWINCH; case 30: return SIGUSR1;
+	case 31: return SIGUSR2; case 18: return SIGTSTP; case 19: return SIGCONT;
+	default: return -1;
+	}
+}
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
 struct knote { struct kev k; int kq, fd; int enabled; struct knote* next; };
 static struct knote* notes;
@@ -57,6 +94,7 @@ static void drop(struct knote* dead) {
 		if (*p == dead) { *p = dead->next; break; }
 	if (dead->fd >= 0 && (dead->k.filter == EVFILT_TIMER || dead->k.filter == EVFILT_USER)) close(dead->fd);
 	else if (dead->fd >= 0 && dead->k.filter == EVFILT_MACHPORT) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
+	else if (dead->fd >= 0 && dead->k.filter == EVFILT_SIGNAL) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
 	else if (dead->fd >= 0 && dead->k.filter == EVFILT_PROC) { epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL); close(dead->fd); }
 	else if (dead->fd >= 0) epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
 	free(dead);
@@ -84,6 +122,7 @@ static long timer_ns(const struct kev* k) {
 // Un knote deshabilitado no puede seguir en epoll (un descriptor legible lo despertaría sin parar).
 static int knote_epoll_events(const struct knote* n) {
 	switch (n->k.filter) {
+	case EVFILT_SIGNAL: return EPOLLIN;
 	case EVFILT_WRITE: return EPOLLOUT | ((n->k.flags & EV_CLEAR) ? EPOLLET : 0);
 	case EVFILT_READ: return EPOLLIN | ((n->k.flags & EV_CLEAR) ? EPOLLET : 0);
 	case EVFILT_MACHPORT: return EPOLLIN;
@@ -140,6 +179,15 @@ static int apply(int kq, const struct kev* c) {
 			n->fd = pfd;
 			ev.events = EPOLLIN;
 			epoll_ctl(kq, EPOLL_CTL_ADD, pfd, &ev);
+			break;
+		}
+		case EVFILT_SIGNAL: {
+			// Señales de Darwin como eventos: un manejador del anfitrión suma al eventfd de esa señal, y el knote lo lee.
+			int ls = darwin_to_linux_sig_k((int)c->ident);
+			if (ls <= 0 || ls >= 65) { drop(n); return D_EINVAL; }
+			n->fd = signal_source(ls);
+			ev.events = EPOLLIN;
+			epoll_ctl(kq, EPOLL_CTL_ADD, n->fd, &ev);
 			break;
 		}
 		case EVFILT_MACHPORT: {
@@ -252,6 +300,11 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 			k.data = (n->k.fflags & 0x04000000u) ? st : 0;
 			k.flags |= 0x8000 | EV_ONESHOT;                                                     // EV_EOF; el kernel elimina el knote y lo avisa con EV_ONESHOT
 			n->k.flags |= EV_ONESHOT;                                                           // un proceso solo sale una vez
+		}
+		else if (n->k.filter == EVFILT_SIGNAL) {
+			uint64_t cnt = 0;
+			if (read(n->fd, &cnt, 8) != 8) continue;                          // otro hilo ya lo recogió
+			k.data = (int64_t)cnt; k.fflags = 0;
 		}
 		else if (n->k.filter == EVFILT_TIMER || n->k.filter == EVFILT_USER) { uint64_t cnt = 0; if (read(n->fd, &cnt, 8) == 8) k.data = (int64_t)cnt; }
 		kev_out(layout, raw, &k);

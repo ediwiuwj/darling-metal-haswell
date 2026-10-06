@@ -176,6 +176,7 @@ static void destroy(uint32_t name) {
 	lock();
 	struct sport* p = find_locked(name);
 	if (p) {
+		logf_("    puerto 0x%x destruido por pid %d (cola=%u)\n", name, (int)getpid(), p->count);
 		int i = port_index(p);
 		for (int k = 0; k < MAXPORTS; k++) if (shm->ports[k].used && shm->ports[k].set == name) shm->ports[k].set = 0;
 		free_msgs_locked(p);
@@ -377,14 +378,18 @@ static long t_construct(struct ctx* c) {
 	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u opt2=0x%x opt3=0x%x contexto=0x%lx\n", n, opt[0], opt[1], opt[2], opt[3], c->a[2]); }
 	return safe_write(c->a[3], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
+// Los nombres de puerto son globales, pero en Mach cada tarea tiene los suyos: quien suelta su derecho de ENVÍO no debe destruir el
+// puerto del receptor. Solo el dueño del derecho de recepción (el creador, o quien lo recibió con MOVE_RECEIVE) puede destruirlo.
+static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
+void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) p->owner = (int32_t)getpid(); unlock(); }
 static long t_destruct(struct ctx* c) {
-	if (port_exists((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
+	if (owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
 	return KERN_OK;
 }
 // mach_port_mod_refs_trap(task, name, right, delta): quitar la última referencia de recepción destruye el puerto
 static long t_mod_refs(struct ctx* c) {
 	int32_t delta = (int32_t)c->a[3];
-	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && port_exists((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
+	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
 	return KERN_OK;
 }
 static long t_nop(struct ctx* c) { (void)c; return KERN_OK; }
@@ -408,6 +413,13 @@ static long t_type(struct ctx* c) {
 	return safe_write(c->a[2], &t, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
 static long t_reply_port(struct ctx* c) { (void)c; return port_create(0); }
+// thread_get_special_reply_port: cada hilo tiene UN puerto de respuesta especial que se reutiliza mientras exista
+static __thread uint32_t special_reply;
+static long t_special_reply_port(struct ctx* c) {
+	(void)c;
+	if (!special_reply || !port_exists(special_reply)) special_reply = port_create(0);
+	return special_reply;
+}
 
 // mach_generate_activity_id(task, cantidad, *id): identificadores de actividad (os_activity) únicos
 static long t_activity_id(struct ctx* c) {
@@ -520,5 +532,5 @@ void emu_port_init(void) {
 	reg_mach(43, t_activity_id);
 	reg_mach(16, t_allocate); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
 	reg_mach(18, t_nop); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_insert_member);
-	reg_mach(26, t_reply_port); reg_mach(50, t_reply_port); reg_mach(76, t_type);
+	reg_mach(26, t_reply_port); reg_mach(50, t_special_reply_port); reg_mach(76, t_type);
 }

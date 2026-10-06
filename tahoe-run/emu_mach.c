@@ -274,7 +274,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		free(m);
 		return r;
 	}
-	if (r) return r;
+	if (r) { if (r != 0x10004003) logf_("    mach_msg: <%d> recepción en 0x%x falló: 0x%x\n", (int)getpid(), rcv_name, r); return r; }
 	struct hdr h;
 	memcpy(&h, m, sizeof h);
 	uint32_t txr = h.bits & 0xff, txl = (h.bits >> 8) & 0xff;
@@ -288,6 +288,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
 			uint8_t type = m[off + 11];
 			if (trace_all && type == 0) { uint32_t nm; memcpy(&nm, m + off, 4); logf_("    mach_msg: <%d> descriptor de puerto 0x%x disposición %u\n", (int)getpid(), nm, m[off + 10]); }
+			if (type == 0 && m[off + 10] == 16) { uint32_t nm; memcpy(&nm, m + off, 4); port_move_receive(nm); }   // MOVE_RECEIVE: el receptor pasa a ser dueño
 			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
 			off += (type == 0) ? 12 : 16;
 		}
@@ -380,7 +381,7 @@ static long mach_msg2(struct ctx* c) {
 	case 3405: n = mig_task_info(&h, req, rep); break;
 	default:
 		if (h.id >= 2800 && h.id < 2900) {                          // IOKit (device.defs): sin registro de E/S todavía -> kIOReturnNotFound
-			if (trace_all) logf_("    iokit id=%d -> kIOReturnNotFound\n", h.id);
+			{ char s[96] = ""; size_t k = 0; for (uint32_t i = 32; i < ssize && k < sizeof s - 1; i++) { uint8_t ch = req[i]; if (ch >= 32 && ch < 127) s[k++] = (char)ch; else if (k && s[k - 1] != 0x7c) s[k++] = 0x7c; } s[k] = 0; logf_("    iokit <%d> id=%d (%u bytes) \"%s\" -> kIOReturnNotFound\n", (int)getpid(), h.id, ssize, s); }
 			n = reply_begin(rep, &h, (int32_t)0xe00002f0);
 			break;
 		}
