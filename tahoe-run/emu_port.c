@@ -30,7 +30,7 @@
 #define MAXPORTS 2048
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner; uint8_t used, is_set; };
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set; pthread_cond_t cv; };   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
 struct shm {
 	pthread_mutex_t lk; pthread_cond_t cv;
@@ -72,6 +72,7 @@ static void shm_init(void) {
 		pthread_mutex_init(&shm->lk, &ma);
 		pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setpshared(&ca, PTHREAD_PROCESS_SHARED); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
 		pthread_cond_init(&shm->cv, &ca);
+		for (int i = 0; i < MAXPORTS; i++) pthread_cond_init(&shm->ports[i].cv, &ca);
 		shm->next_name = 0x2503;
 		for (int i = 0; i < MAXMSG; i++) shm->msgs[i].next = i + 1 < MAXMSG ? (uint32_t)(i + 2) : 0;   // índices desde 1; 0 = fin
 		shm->free_head = 1;
@@ -109,22 +110,24 @@ static struct sport* find_locked(uint32_t name) {
 static int port_index(struct sport* p) { return (int)(p - shm->ports); }
 
 // Despierta a quien espere por un puerto con epoll (el dueño puede ser otro proceso).
-static void poke(uint32_t name) {
+static void poke(uint32_t name, int32_t rpid) {
 	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (s < 0) return;
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
-	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name);
+	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u.%d", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name, (int)rpid);
 	char b = 1;
 	if (sendto(s, &b, 1, 0, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) {}
 	close(s);
 }
-static void drain_one(int fd) { char b; if (fd >= 0 && recv(fd, &b, 1, MSG_DONTWAIT) < 0) {} }
+// Vacía todos los avisos pendientes del socket: el aviso es un nivel ("hay mensajes"), no un contador; la cola de datagramas
+// de Unix es corta y puede perder avisos, así que tras recibir se vuelve a avisar si aún quedan mensajes.
+static void drain_all(int fd) { char b[64]; if (fd < 0) return; while (recv(fd, b, sizeof b, MSG_DONTWAIT) > 0) {} }
 
-static int make_wake_socket(uint32_t name) {
+static int make_wake_socket(uint32_t name, int32_t rpid) {
 	int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (s < 0) return -1;
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
-	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name);
+	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u.%d", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name, (int)rpid);
 	if (bind(s, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) { close(s); return -1; }
 	return s;
 }
@@ -135,9 +138,9 @@ uint32_t port_create(int is_set) {
 	struct sport* p = NULL;
 	for (int i = 0; i < MAXPORTS; i++) if (!shm->ports[i].used) { p = &shm->ports[i]; break; }
 	if (!p) { unlock(); logf_("    puertos: tabla llena\n"); return 0; }
-	memset(p, 0, sizeof *p);
-	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid();
-	local_sock[port_index(p)] = make_wake_socket(name);
+	{ pthread_cond_t keep = p->cv; memset(p, 0, sizeof *p); p->cv = keep; }   // la variable de condición se inicializó al crear la región
+	p->used = 1; p->is_set = (uint8_t)is_set; p->name = name; p->owner = (int32_t)getpid(); p->rpid = (int32_t)getpid();
+	local_sock[port_index(p)] = make_wake_socket(name, p->rpid);
 	unlock();
 	if (trace_all) logf_("    puerto 0x%x creado por pid %d (conjunto=%d)\n", name, (int)getpid(), is_set);
 	return name;
@@ -146,7 +149,23 @@ uint32_t port_create(int is_set) {
 int port_exists(uint32_t name) { lock(); int r = find_locked(name) != NULL; unlock(); return r; }
 
 // Socket legible mientras haya mensajes pendientes (solo para puertos que creó este proceso). -1 si no.
-int port_eventfd(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? local_sock[port_index(p)] : -1; unlock(); return r; }
+int port_eventfd(uint32_t name) {
+	lock();
+	struct sport* p = find_locked(name);
+	int r = -1;
+	if (p) {
+		int i = port_index(p);
+		if (p->rpid != (int32_t)getpid() || local_sock[i] < 0) {             // el derecho de recepción se movió a este proceso
+			if (local_sock[i] >= 0) close(local_sock[i]);
+			p->rpid = (int32_t)getpid();
+			local_sock[i] = make_wake_socket(name, p->rpid);
+			if (p->count) poke(name, p->rpid);                              // ya hay mensajes: despertar de inmediato
+		}
+		r = local_sock[i];
+	}
+	unlock();
+	return r;
+}
 
 static void free_msgs_locked(struct sport* p) {
 	while (p->head) { struct mslot* q = &shm->msgs[p->head - 1]; uint32_t nx = q->next; q->next = shm->free_head; shm->free_head = p->head; p->head = nx; }
@@ -162,7 +181,7 @@ static void destroy(uint32_t name) {
 		free_msgs_locked(p);
 		if (local_sock[i] >= 0) { close(local_sock[i]); local_sock[i] = -1; }
 		p->used = 0;
-		pthread_cond_broadcast(&shm->cv);   // quien espere en este puerto debe enterarse de que murió
+		pthread_cond_broadcast(&p->cv);   // quien espere en este puerto debe enterarse de que murió
 	}
 	unlock();
 }
@@ -215,11 +234,13 @@ int port_send(uint32_t dest, const uint8_t* msg, uint32_t size) {
 	if (p->tail) shm->msgs[p->tail - 1].next = idx; else p->head = idx;
 	p->tail = idx; p->count++;
 	uint32_t setname = p->set;
-	if (setname) { struct sport* s = find_locked(setname); if (s) s->count++; }
-	pthread_cond_broadcast(&shm->cv);
+	int32_t rp_dest = p->rpid, rp_set = 0;
+	if (setname) { struct sport* s = find_locked(setname); if (s) { s->count++; rp_set = s->rpid; } }
+	pthread_cond_broadcast(&p->cv);
+	if (setname) { struct sport* st2 = find_locked(setname); if (st2) pthread_cond_broadcast(&st2->cv); }
 	unlock();
-	poke(dest);
-	if (setname) poke(setname);
+	poke(dest, rp_dest);
+	if (setname) poke(setname, rp_set);
 	return 0;
 }
 
@@ -256,9 +277,13 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 			q->next = shm->free_head; shm->free_head = idx;
 			int si = port_index(src);
 			int fd1 = local_sock[si], fd2 = -1;
-			if (src->set) { struct sport* s = find_locked(src->set); if (s) fd2 = local_sock[port_index(s)]; }
+			uint32_t rem1 = src->count, rname1 = src->name, rname2 = 0, rem2 = 0;
+			int32_t rp1 = src->rpid, rp2 = 0;
+			if (src->set) { struct sport* s = find_locked(src->set); if (s) { fd2 = local_sock[port_index(s)]; rem2 = s->count; rname2 = s->name; rp2 = s->rpid; } }
 			unlock();
-			drain_one(fd1); drain_one(fd2);
+			drain_all(fd1); drain_all(fd2);
+			if (rem1) poke(rname1, rp1);                        // aún quedan mensajes: renovar el aviso
+			if (rem2) poke(rname2, rp2);
 			// materializar los descriptores OOL en memoria nueva de este proceso
 			uint32_t ooff[32], olen[32];
 			int nool = ool_scan(m, sz, ooff, olen, 32);
@@ -277,7 +302,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 		}
 		waited = 1;
 		if (trace_all) logf_("    mach_msg: <%d> espera mensaje en 0x%x (plazo %d ms)\n", (int)getpid(), name, timeout_ms);
-		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&shm->cv, &shm->lk, &dl) : pthread_cond_wait(&shm->cv, &shm->lk);
+		int r = timeout_ms >= 0 ? pthread_cond_timedwait(&p->cv, &shm->lk, &dl) : pthread_cond_wait(&p->cv, &shm->lk);
 		if (r == EOWNERDEAD) pthread_mutex_consistent(&shm->lk);
 		else if (r) { unlock(); return MACH_RCV_TIMED_OUT; }
 	}

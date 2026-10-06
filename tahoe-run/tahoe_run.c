@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "sysnames.h"
+#include <sched.h>
 #include "tahoe.h"
 
 #ifndef SYS_USER_DISPATCH
@@ -368,7 +369,7 @@ static void load_macho(const char* path, uint64_t slide, struct image* out) {
 	free(cmds);
 	close(fd);
 	if (!out->mh) DIE("%s: no se encontró el segmento __TEXT", path);
-	LOG("cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
+	LOG("<%d> cargado %-28s mh=0x%lx entrada=0x%lx tipo=%u\n", (int)getpid(), strrchr(path, '/') ? strrchr(path, '/') + 1 : path, out->mh, out->entry, out->filetype);
 }
 
 // ---------------------------------------------------------------- pila inicial
@@ -613,6 +614,15 @@ static long vm_alloc(uint64_t addr_ptr, uint64_t size, int flags, uint64_t mask,
 		int extra = (flags & VM_FLAGS_OVERWRITE) ? MAP_FIXED : MAP_FIXED_NOREPLACE;
 		p = mmap((void*)want, size, prot, MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
 	}
+	if (trace_all) logf_("    vm_alloc <%d> (size=0x%lx mask=0x%lx flags=0x%x prot=%d) -> %p\n", (int)getpid(), size, mask, flags, prot, p);
+	if (p != MAP_FAILED && mask == 0x7fffff && size == 0x2000000 && (flags & VM_FLAGS_ANYWHERE)) {
+		// Montón de continuaciones de libdispatch: elige el segmento de 8 MiB con el "número de CPU" que lee de SIDT. En macOS ese
+		// número va en el LÍMITE de la IDT; en Linux el límite es siempre 0xfff, así que siempre usa el segmento 0xfff
+		// (a base + 0xfff*8 MiB). Se reserva ese segmento, relleno de ceros y sin coste hasta que se toca.
+		void* seg = mmap((uint8_t*)p + (0xfffULL << 23), 1ULL << 23, PROT_READ | PROT_WRITE,
+		                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+		if (seg == MAP_FAILED && trace_all) logf_("    vm_alloc: no se pudo reservar el segmento SIDT (%s)\n", strerror(errno));
+	}
 	if (p == MAP_FAILED) return KERN_NO_SPACE_;
 	return safe_write64(addr_ptr, (uint64_t)p) == 0 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
 }
@@ -733,7 +743,56 @@ static void on_sigill(int sig, siginfo_t* si, void* v) {
 	_exit(132);
 }
 
+// SIDT/SGDT: con UMIP la CPU las impide en espacio de usuario (#GP -> SIGSEGV). libdispatch usa SIDT como "número de CPU":
+// en macOS los 12 bits bajos de la base de la IDT son el índice de CPU, y con él elige un segmento de su montón. Se emula
+// devolviendo límite 0xfff y una base con el número de CPU actual (módulo 4: el montón reserva 4 segmentos de 8 MiB).
+static int emulate_sidt(ucontext_t* uc) {
+	greg_t* g = uc->uc_mcontext.gregs;
+	const uint8_t* ip = (const uint8_t*)g[REG_RIP];
+	size_t i = 0;
+	while (ip[i] == 0x66 || ip[i] == 0x2e || ip[i] == 0x3e || ip[i] == 0x65 || ip[i] == 0x64) i++;       // prefijos
+	if ((ip[i] & 0xf0) == 0x40) i++;                                                                        // REX
+	if (ip[i] != 0x0f || ip[i + 1] != 0x01) return 0;
+	uint8_t modrm = ip[i + 2];
+	int reg = (modrm >> 3) & 7, mod = modrm >> 6, rm = modrm & 7;
+	if ((reg != 0 && reg != 1) || mod == 3) return 0;                                                       // solo SGDT/SIDT con memoria
+	size_t len = i + 3;
+	uint64_t addr = 0;
+	static const int regmap[16] = { REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+		REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15 };
+	int rex = ((ip[i - 1] & 0xf0) == 0x40) ? ip[i - 1] : 0;
+	if (rm == 4) {                                                                                          // SIB
+		uint8_t sib = ip[len++];
+		int base = (sib & 7) | ((rex & 1) ? 8 : 0), idx = ((sib >> 3) & 7) | ((rex & 2) ? 8 : 0), sc = sib >> 6;
+		if (!(mod == 0 && (sib & 7) == 5)) addr += (uint64_t)g[regmap[base]];
+		if (idx != 4) addr += (uint64_t)g[regmap[idx]] << sc;
+		if (mod == 0 && (sib & 7) == 5) { int32_t d; memcpy(&d, ip + len, 4); len += 4; addr += (int64_t)d; }
+	} else if (mod == 0 && rm == 5) {                                                                       // RIP relativo
+		int32_t d; memcpy(&d, ip + len, 4); len += 4;
+		addr = (uint64_t)g[REG_RIP] + len + (int64_t)d;
+		mod = 3;                                                                                            // ya sumado: sin desplazamiento extra
+	} else addr += (uint64_t)g[regmap[rm | ((rex & 1) ? 8 : 0)]];
+	if (mod == 1) { int8_t d = (int8_t)ip[len++]; addr += (int64_t)d; }
+	else if (mod == 2) { int32_t d; memcpy(&d, ip + len, 4); len += 4; addr += (int64_t)d; }
+	int cpu = sched_getcpu();
+	uint16_t limit = 0xfff;
+	uint64_t base = 0xffffff8000000000ULL | (uint64_t)((cpu < 0 ? 0 : cpu) % 4);
+	memcpy((void*)addr, &limit, 2);
+	memcpy((void*)(addr + 2), &base, 8);
+	g[REG_RIP] += (greg_t)len;
+	return 1;
+}
+static void on_sigsegv(int sig, siginfo_t* si, void* v) {
+	(void)sig;
+	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+	if (si->si_code == 0x80 /*SI_KERNEL*/ && emulate_sidt(v)) { selector = SYSCALL_DISPATCH_FILTER_BLOCK; return; }
+	logf_("    SIGSEGV <%d> dirección=%p rip=0x%llx\n", getpid(), si->si_addr, (unsigned long long)((ucontext_t*)v)->uc_mcontext.gregs[REG_RIP]);
+	diag_crash(v);
+	_exit(139);
+}
+
 static void install_dispatch(void) {
+	{ struct sigaction ss = { .sa_sigaction = on_sigsegv, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER }; sigaction(SIGSEGV, &ss, NULL); }
 	struct sigaction sa = { .sa_sigaction = on_sigill, .sa_flags = SA_SIGINFO | SA_ONSTACK };
 	sigaction(SIGILL, &sa, NULL);
 	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };

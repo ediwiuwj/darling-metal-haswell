@@ -342,8 +342,11 @@ desensambla bytes sueltos, usar `objdump -D -b binary -m i386:x86-64`; `ipsw dyl
 la caché x86_64.
 
 
-### Estado de `launchctl`
-`launchctl managername` (→ `System`) y `launchctl list` (los servicios reales de `launchd`, con sus PID) **funcionan**. Se arreglaron dos cosas:
-`mach_msg2` truncaba los mensajes de más de 1 KB (la lista de servicios son 12 KB) y `libsystem_notify` bloqueaba al cliente: envía
-un sondeo sin cuerpo (ids 1023-1030) al puerto de `notifyd` y espera respuesta. Hoy esos sondeos se contestan con una respuesta MIG vacía
-(un apaño de `emu_mach.c`, no un `notifyd` de verdad: `notifyd` no llega a atender ese puerto). `launchctl print system` responde "Bad request".
+### Estado de `launchctl` y `notifyd`
+`launchctl managername` (→ `System`) y `launchctl list` funcionan, y **`notifyd` real atiende a sus clientes** (ya no hay avisos
+`notify_register_check failed`). Arreglos que lo permitieron: mensajes Mach de más de 1 KB; el derecho de recepción que `launchd`
+mueve a un servicio necesita un aviso de despertar propio del nuevo receptor (`port_eventfd` lo recrea y avisa si ya hay mensajes);
+los avisos son un nivel (se vacían y se renuevan mientras quede cola: la cola de datagramas de Unix es corta y perdía avisos);
+variables de condición por puerto (antes una global despertaba a todos); y `SIDT`: libdispatch lee de ahí el "número de CPU" (en macOS
+va en el límite de la IDT; en Linux siempre vale 0xfff), así que se reserva el segmento 0xfff de su montón de 32 MiB.
+`launchctl print system` responde "Bad request" (pendiente).

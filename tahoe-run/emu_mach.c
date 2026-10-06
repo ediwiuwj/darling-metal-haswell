@@ -287,6 +287,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		memcpy(&dc, m + 24, 4);
 		for (uint32_t i = 0; i < dc && off + 12 <= size; i++) {
 			uint8_t type = m[off + 11];
+			if (trace_all && type == 0) { uint32_t nm; memcpy(&nm, m + off, 4); logf_("    mach_msg: <%d> descriptor de puerto 0x%x disposición %u\n", (int)getpid(), nm, m[off + 10]); }
 			if (type == 0 || type == 2) m[off + 10] = (uint8_t)rx_disp(m[off + 10]);       // puerto / puertos OOL: disposición
 			off += (type == 0) ? 12 : 16;
 		}
@@ -344,14 +345,6 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		port_send(h.remote, req, ssize);
-		if (h.id >= 1023 && h.id <= 1030 && ssize == 24 && h.local) {   // sondeos de libnotify sin cuerpo: respuesta MIG correcta (NDR + retcode 0)
-			uint8_t rb[36] = { 0 };
-			struct hdr rh = { .bits = 0x12, .size = 36, .remote = h.local, .local = 0, .voucher = 0, .id = h.id + 100 };
-			memcpy(rb, &rh, 24);
-			static const uint8_t ndr[8] = { 0, 0, 0, 0, 1, 0, 0, 0 };
-			memcpy(rb + 24, ndr, 8);
-			port_send(h.local, rb, 36);
-		}
 		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
 		return (options & 2) ? user_receive(c, options, buf, rcv_name, rcvsize) : MACH_MSG_SUCCESS;
 	}
