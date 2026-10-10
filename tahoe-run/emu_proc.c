@@ -425,6 +425,8 @@ static long exec_common(uint64_t pathp, uint64_t argvp, uint64_t envp, int spawn
 	if (getenv("TAHOE_PORTS")) { snprintf(b4, sizeof b4, "TAHOE_PORTS=%s", getenv("TAHOE_PORTS")); nenv[e++] = b4; }
 	if (getenv("TAHOE_PORTS_OWNER")) { snprintf(b5, sizeof b5, "TAHOE_PORTS_OWNER=%s", getenv("TAHOE_PORTS_OWNER")); nenv[e++] = b5; }
 	if (getenv("TAHOE_LOGFILE")) { snprintf(b3, sizeof b3, "TAHOE_LOGFILE=%s", getenv("TAHOE_LOGFILE")); nenv[e++] = b3; }
+	static char b6[600];
+	if (getenv("TAHOE_CACHE_DIR")) { snprintf(b6, sizeof b6, "TAHOE_CACHE_DIR=%s", getenv("TAHOE_CACHE_DIR")); nenv[e++] = b6; }
 	if (getenv("TAHOE_FD2LOG")) nenv[e++] = (char*)"TAHOE_FD2LOG=1";
 	if (trace_all) nenv[e++] = (char*)"TAHOE_TRACE=1";
 	for (int i = 0; i < spawn_special_n; i++) nenv[e++] = spawn_special_env[i];

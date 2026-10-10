@@ -26,6 +26,7 @@
 #include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <pwd.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -206,9 +207,17 @@ static void apply_cache_slide(int fd, const char* path) {
 static int slid_open(const char* path, int create_flags, char* out, size_t cap) {
 	struct stat st;
 	if (stat(path, &st) != 0) return -1;
+	// El directorio lo fija el primer proceso y se hereda por TAHOE_CACHE_DIR: los servicios que lanza launchd no tienen HOME,
+	// y sin esto cada uno recalculaba el slide (45 MB privados por proceso) y escribía su propia copia.
 	const char* dir = getenv("TAHOE_CACHE_DIR");
 	char d[512];
-	if (!dir) { const char* h = getenv("HOME"); snprintf(d, sizeof d, "%s/.cache/tahoe-run", h ? h : "/tmp"); dir = d; }
+	if (!dir) {
+		const char* h = getenv("HOME");
+		struct passwd* pw = h ? NULL : getpwuid(getuid());
+		snprintf(d, sizeof d, "%s/.cache/tahoe-run", h ? h : (pw ? pw->pw_dir : "/tmp"));
+		setenv("TAHOE_CACHE_DIR", d, 1);
+		dir = getenv("TAHOE_CACHE_DIR");
+	}
 	mkdir(dir, 0755);
 	const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
 	snprintf(out, cap, "%s/%s.%llx.%llx.slid", dir, base, (unsigned long long)st.st_size, (unsigned long long)st.st_mtime);
