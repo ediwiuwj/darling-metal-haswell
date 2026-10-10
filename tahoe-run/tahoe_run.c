@@ -200,6 +200,21 @@ static void apply_cache_slide(int fd, const char* path) {
 	}
 }
 
+// Aplicar el slide de la caché toca ~60 MB de páginas de datos. Hecho en cada proceso, 40 procesos copian 2.4 GB y la máquina
+// acaba en swap. Se hace UNA vez: las páginas ya corregidas se guardan en un archivo (mismas posiciones que la caché original) y
+// cada proceso las mapea MAP_PRIVATE desde él, así que comparten la caché de páginas del núcleo y solo copian lo que escriben.
+static int slid_open(const char* path, int create_flags, char* out, size_t cap) {
+	struct stat st;
+	if (stat(path, &st) != 0) return -1;
+	const char* dir = getenv("TAHOE_CACHE_DIR");
+	char d[512];
+	if (!dir) { const char* h = getenv("HOME"); snprintf(d, sizeof d, "%s/.cache/tahoe-run", h ? h : "/tmp"); dir = d; }
+	mkdir(dir, 0755);
+	const char* base = strrchr(path, '/'); base = base ? base + 1 : path;
+	snprintf(out, cap, "%s/%s.%llx.%llx.slid", dir, base, (unsigned long long)st.st_size, (unsigned long long)st.st_mtime);
+	return open(out, create_flags, 0644);
+}
+
 static void map_one(const char* path) {
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) DIE("no puedo abrir %s: %s", path, strerror(errno));
@@ -208,8 +223,21 @@ static void map_one(const char* path) {
 	uint32_t off = *(uint32_t*)(h + 0x10), cnt = *(uint32_t*)(h + 0x14);
 	struct { uint64_t addr, size, fileoff; uint32_t maxprot, initprot; } m[16];
 	if (cnt > 16 || pread(fd, m, cnt * sizeof m[0], off) != (ssize_t)(cnt * sizeof m[0])) DIE("tabla de mapeos ilegible en %s", path);
+
+	// ¿Qué mapeos llevan slide? (los mismos que recorre apply_cache_slide)
+	uint32_t soff = 0, scnt = 0;
+	struct { uint64_t address, size, fileoff, slide_off, slide_size, flags; uint32_t maxprot, initprot; } sm[16];
+	int has_slide[16] = { 0 };
+	if (pread(fd, &soff, 4, 0x138) == 4 && pread(fd, &scnt, 4, 0x13c) == 4 && soff && scnt && scnt <= 16 &&
+	    pread(fd, sm, scnt * sizeof sm[0], soff) == (ssize_t)(scnt * sizeof sm[0]))
+		for (uint32_t i = 0; i < scnt && i < cnt; i++) has_slide[i] = sm[i].slide_size != 0;
+
+	char slidpath[1024];
+	int sfd = slid_open(path, O_RDONLY, slidpath, sizeof slidpath);        // ya existe: mapear los datos corregidos
+	int have_slid = sfd >= 0;
 	for (uint32_t i = 0; i < cnt; i++) {
-		void* p = mmap((void*)m[i].addr, m[i].size, m[i].initprot, MAP_PRIVATE | MAP_FIXED_NOREPLACE, fd, m[i].fileoff);
+		int from = (have_slid && has_slide[i]) ? sfd : fd;
+		void* p = mmap((void*)m[i].addr, m[i].size, m[i].initprot, MAP_PRIVATE | MAP_FIXED_NOREPLACE, from, m[i].fileoff);
 		if (p == MAP_FAILED) {
 			if (errno == EEXIST && !getenv("TAHOE_REEXEC")) {
 				// algo del proceso ya ocupa esa dirección (ASLR): reintentar sin aleatorización
@@ -220,7 +248,31 @@ static void map_one(const char* path) {
 			DIE("mmap de la caché falló en 0x%lx (+0x%lx): %s", m[i].addr, m[i].size, strerror(errno));
 		}
 	}
-	apply_cache_slide(fd, path);
+	if (!have_slid) {
+		apply_cache_slide(fd, path);
+		// Publicar el resultado para los demás procesos: archivo temporal y rename atómico (si dos procesos compiten, gana uno).
+		char tmp[1100];
+		snprintf(tmp, sizeof tmp, "%s.%d.tmp", slidpath, (int)getpid());
+		int tf = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (tf >= 0) {
+			struct stat st; fstat(fd, &st);
+			int ok = ftruncate(tf, st.st_size) == 0;
+			for (uint32_t i = 0; ok && i < cnt; i++) {
+				if (!has_slide[i]) continue;
+				// la memoria está en RW o R según initprot; los mapeos con slide son legibles
+				uint64_t done = 0;
+				while (done < m[i].size) {
+					ssize_t w = pwrite(tf, (void*)(m[i].addr + done), m[i].size - done, m[i].fileoff + done);
+					if (w <= 0) { ok = 0; break; }
+					done += (uint64_t)w;
+				}
+			}
+			close(tf);
+			if (ok && rename(tmp, slidpath) == 0) { if (trace_all) logf_("    caché con slide guardada en %s\n", slidpath); }
+			else unlink(tmp);
+		}
+	}
+	if (sfd >= 0) close(sfd);
 	close(fd);
 }
 

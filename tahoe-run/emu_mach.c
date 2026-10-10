@@ -375,7 +375,7 @@ static long mach_msg2(struct ctx* c) {
 		if (cnt > 2) cnt = 2;
 		if (!cnt) cnt = 1;
 		uint64_t v[6] = { 0 };
-		if (safe_read(c->a[0], v, cnt * 24) != (ssize_t)(cnt * 24)) return 0x10000003;
+		if (safe_read(c->a[0], v, cnt * 24) != (ssize_t)(cnt * 24)) return 0x10000002;
 		buf = v[0]; rbuf = v[1] ? v[1] : v[0];
 		ssize = (uint32_t)v[2]; rcvsize = (uint32_t)(v[2] >> 32);
 		if (cnt == 2) { aux_addr = v[4] ? v[4] : v[3]; aux_size = (uint32_t)(v[5] >> 32); }
@@ -388,7 +388,7 @@ static long mach_msg2(struct ctx* c) {
 	if (!(options & 1) && (options & 2)) return vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size);
 	if (ssize < sizeof(struct hdr) || ssize > sizeof reqbuf || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
-		return 0x10000003;                                      // MACH_SEND_INVALID_DATA
+		return 0x10000002;                                      // MACH_SEND_INVALID_DATA
 	}
 	struct hdr h;
 	memcpy(&h, req, sizeof h);
@@ -399,6 +399,7 @@ static long mach_msg2(struct ctx* c) {
 	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
+	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
 		port_send(h.remote, req, ssize);
@@ -407,6 +408,7 @@ static long mach_msg2(struct ctx* c) {
 	}
 	size_t n;
 	switch (h.id) {
+	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_request_notification / thread_policy(_set): sin efecto
 	case 3240: {                                                  // mach_port_is_connection_for_service(conexión, servicio) -> id de política de filtro
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0
