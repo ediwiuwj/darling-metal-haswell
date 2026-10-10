@@ -49,6 +49,7 @@
 #define STACK_SIZE   (8UL << 20)
 
 int trace_all;
+__thread int g_watch;   // diagnóstico: traza completa de las llamadas de un hilo concreto (ver thread_main)
 
 // ---------------------------------------------------------------- utilidades
 static int logfd = 2;   // descriptor privado del registro: el programa (p. ej. launchd) puede redirigir el 2 a /dev/null
@@ -738,7 +739,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		const char* verdict;
 		if (num < BSD_NAMES_N && bsd_table[num]) { r = bsd_table[num](&c); verdict = "ok   "; }
 		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
-		if (trace_all || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
+		if (trace_all || g_watch || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }
@@ -746,7 +747,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		const char* name = num < MACH_NAMES_N ? mach_names[num] : NULL;
 		if (num < MACH_NAMES_N && mach_table[num]) {
 			g[REG_RAX] = mach_table[num](&c);
-			if (trace_all) log_call("mach", num, name, &c, "ok   ");
+			if (trace_all || g_watch) log_call("mach", num, name, &c, "ok   ");
 		} else {
 			log_call("mach", num, name, &c, "FALTA");
 			g[REG_RAX] = KERN_FAILURE_;

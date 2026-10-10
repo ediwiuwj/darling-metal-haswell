@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -87,6 +88,7 @@ static struct knote* notes;
 // según el reparto de tiempos). También protege la lista y la tabla de workloops.
 static pthread_mutex_t kq_lock = PTHREAD_MUTEX_INITIALIZER;
 static int knote_alive(const struct knote* n) { for (const struct knote* q = notes; q; q = q->next) if (q == n) return 1; return 0; }
+#define WQ_KQID_WORKQ (~0ULL)   // identificador interno del kqueue de la cola de trabajo (kevent_qos con kq = -1)
 static int workq_kq = -1;
 
 static struct knote* find(int kq, uint64_t ident, int filter) {
@@ -276,6 +278,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		struct knote* n = es[i].data.ptr;
 		if (!knote_alive(n)) continue;                                   // lo eliminó otro hilo tras epoll_wait
 		if ((trace_all || mach_trace()) && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (activo=%d, dout=%d)\n", n->k.ident, n->enabled, g_dout != 0);
+		if (mach_trace() && n->k.filter != EVFILT_MACHPORT) { static _Atomic int cnt; if (atomic_fetch_add(&cnt, 1) < 300) logf_("    kevent: <%d> listo filtro=%d ident=0x%lx flags=0x%x fflags=0x%x en=%d ev=0x%x\n", (int)getpid(), n->k.filter, n->k.ident, n->k.flags, n->k.fflags, n->enabled, es[i].events); }
 		if (!n->enabled) continue;
 		struct kev k = n->k;
 		k.flags &= (uint16_t)~(EV_ADD | EV_ENABLE | EV_DISABLE | EV_DELETE | EV_RECEIPT | 0x200 /*EV_VANISHED*/);   // el kernel no repite las banderas de registro
@@ -346,13 +349,16 @@ static long bsd_kevent64(struct ctx* c) { g_dout = 0; g_no_poll = 0; return do_k
 static long bsd_kevent_qos(struct ctx* c) {
 	uint64_t flags = ctx_arg(c, 7);
 	g_dout = c->a[5]; g_davail = ctx_arg(c, 6); g_no_poll = (flags & 2) != 0;
-	return do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	long r = do_kevent((int)c->a[0], 2, c->a[1], (long)(int)c->a[2], c->a[3], (long)(int)c->a[4], (flags & 1) ? 0 : -1);
+	if ((int)c->a[0] == -1) wq_arm_workloop(WQ_KQID_WORKQ);   // los eventos de la cola de trabajo piden un hilo cuando haya alguno listo
+	return r;
 }
 
 // kevent_id(id, changelist, nchanges, eventlist, nevents, data_out, data_available, flags): cola de trabajo de
 // libdispatch (workloop); cada identificador tiene su propio kqueue.
 static struct { uint64_t id; int kq; } workloops[64];
 int kq_workloop_fd(uint64_t id) {
+	if (id == WQ_KQID_WORKQ) return workq_kq_get();
 	static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
 	int r = -1;
 	pthread_mutex_lock(&wl_lock);

@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <poll.h>
+#include <stdatomic.h>
 #include <setjmp.h>
 #include <sys/mman.h>
 #include <stdlib.h>
@@ -488,8 +489,11 @@ static void* thread_main(void* p) {
 	struct new_thread t = *(struct new_thread*)p;
 	free(p);
 	// Como XNU: base de GS en el TSD del hilo, se avisa con TSD_BASE_SET y se retira SUSPENDED (libpthread lo exige).
+	{ FILE* f = fopen("/dev/shm/tahoe-watch-func", "r"); unsigned long fn = 0; if (f) { if (fscanf(f, "%lx", &fn) != 1) fn = 0; fclose(f); } g_watch = fn && fn == t.func; }
 	uint64_t flags = t.flags & ~0x20000000u;
-	uint32_t kport = alloc_port();                       // cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
+	uint32_t kport = alloc_port();
+	if (mach_trace()) logf_("    THR <%d:%ld> puerto de hilo 0x%x func=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), kport, t.func);
+	// cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
 	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
 	enter_guest_thread(thread_start_fn, t.stack, t.pthread, kport, t.func, t.arg, t.stack, flags);
@@ -504,7 +508,8 @@ static long bsd_bsdthread_create(struct ctx* c) {
 	pthread_t th;
 	int e = pthread_create(&th, &at, thread_main, t);
 	if (e) { free(t); return -35 /* EAGAIN de Darwin */; }
-	if (mach_trace()) logf_("    THR <%d> crea hilo func=0x%lx arg=0x%lx\n", (int)getpid(), c->a[0], c->a[1]);
+	if (mach_trace()) { uint64_t w[8] = { 0 }; safe_read(c->a[3] + 0, w, 0); safe_read(c->a[1], w, 64);   // arg de thread_fun: estructura con la rutina real
+		logf_("    THR <%d> crea hilo func=0x%lx arg=0x%lx [%lx %lx %lx %lx]\n", (int)getpid(), c->a[0], c->a[1], w[0], w[1], w[2], w[3]); }
 	if (trace_all) logf_("    bsdthread_create: pthread=0x%lx stack=0x%lx flags=0x%lx\n", c->a[3], c->a[2], c->a[4]);
 	return (long)c->a[3];
 }
@@ -569,16 +574,20 @@ static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize) {
 	int nev = 0;
 	my_workloop = j.workloop ? j.kqid : 0;
 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
-	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
+	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
 		if (!data) data = mmap(NULL, 32768 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		uint64_t* avail = (uint64_t*)(data + 32768);
 		*avail = 32768;
 		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
+		if (mach_trace()) { static _Atomic int cn; if (atomic_fetch_add(&cn, 1) < 400) logf_("    kq_drain <%d> kqid=0x%lx req=%d -> %ld eventos\n", (int)getpid(), (unsigned long)j.kqid, j.has_req, d); }
 		if (d > 0) nev += (int)d; }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
 	if (sigsetjmp(wq_park, 1) == 0) {
 		wq_park_ok = 1;
-		enter_guest_thread(wqthread_fn, self - 0x3000, self, alloc_port(), (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
+		static __thread uint32_t kp_cache; if (!kp_cache) kp_cache = alloc_port();
+		uint32_t kp = kp_cache;
+		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), kp);
+		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
 	}
 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
 }
@@ -661,8 +670,10 @@ static void wl_finished(uint64_t kqid) {
 static void* wl_watch(void* p) {
 	uint64_t kqid = (uint64_t)p;
 	struct pollfd pf = { .fd = kq_workloop_fd(kqid), .events = POLLIN };
+	if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx fd=%d espera\n", (int)getpid(), (unsigned long)kqid, pf.fd);
 	for (;;) {
 		if (poll(&pf, 1, -1) < 0 && errno != EINTR) break;
+		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx despierta revents=0x%x\n", (int)getpid(), (unsigned long)kqid, pf.revents);
 		if (!(pf.revents & POLLIN)) continue;
 		pthread_mutex_lock(&wl_lock);
 		struct wl_state* w = wl_states;
@@ -714,8 +725,8 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 			memcpy(&id, kv, 8); memcpy(&f, kv + 8, 2); memcpy(&fl, kv + 10, 2); memcpy(&ud, kv + 16, 8); memcpy(&ff, kv + 24, 4); memcpy(ext, kv + 40, 32);
 			logf_("      retorno: ident=0x%lx filter=%d flags=0x%x fflags=0x%x udata=0x%lx ext=%lx,%lx,%lx,%lx\n", id, f, fl, ff, ud, ext[0], ext[1], ext[2], ext[3]);
 		}
-		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2], my_workloop);
-		if (op == 0x100 && my_workloop) wl_finished(my_workloop);
+		if ((op == 0x100 || op == 0x40) && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2], my_workloop);   // 0x40: THREAD_KEVENT_RETURN
+		if ((op == 0x100 || op == 0x40) && my_workloop) wl_finished(my_workloop);
 		if (wq_park_ok) siglongjmp(wq_park, 1);                    // aparcar = volver al grupo de hilos
 		syscall(SYS_exit, 0);
 		return 0;
@@ -748,6 +759,18 @@ static long bsd_map_with_linking(struct ctx* c) { (void)c; return -D_ENOSYS; }
 // ulock (os_unfair_lock, dispatch_once, libpthread): ulock_wait/ulock_wake sobre futex de Linux. Con ULF_NO_ERRNO
 // (0x1000000) los errores vuelven como valor negativo en lugar de por errno; aquí se devuelven siempre como errno.
 #include <linux/futex.h>
+// Diagnóstico: tabla de los hilos que esperan en un ulock; un hilo vigilante la vuelca pasados unos segundos.
+static struct { volatile long tid; volatile uint32_t* addr; volatile uint32_t expect; volatile uint64_t op; volatile uint64_t spin; } wait_tab[256];
+static void* wait_dump_thread(void* a) {
+	(void)a;
+	sleep(12);
+	for (int i = 0; i < 256; i++) if (wait_tab[i].tid) logf_("    WAITTAB tid=%ld addr=%p esperado=0x%x op=0x%lx valor_actual=0x%x (%lx)\n", wait_tab[i].tid, (void*)wait_tab[i].addr, wait_tab[i].expect, (unsigned long)wait_tab[i].op, *wait_tab[i].addr, (unsigned long)((uint64_t*)wait_tab[i].addr)[0]);
+	return NULL;
+}
+// XNU devuelve de ulock_wait cuántos hilos más siguen esperando en esa dirección; libplatform (os_unfair_lock) lo usa para
+// no marcar la cerradura "sin esperadores" al adquirirla tras despertar: si siempre fuera 0, quedarían hilos dormidos
+// sin que nadie los despierte. Contadores por cubo de dirección (una colisión solo sobreestima, lo que es inocuo).
+static _Atomic int ulock_waiters[1024];
 static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	uint32_t* addr = (uint32_t*)c->a[1];
 	uint32_t expect = (uint32_t)c->a[2];
@@ -759,11 +782,22 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 		if (want < 0) { char nm[64] = "", cl[512] = ""; FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
 			f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
 			want = nm[0] && strstr(cl, nm); }
-		if (want && !timeout_ns) { logf_("    ULW <%d:%ld> %p esperado=0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect); diag_crash(c->uc); }
+		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_crash(c->uc); }
 	}
 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
+	int wslot = -1;
+	if (mach_trace() && access("/dev/shm/tahoe-waittab", F_OK) == 0) {
+		static pthread_once_t once = PTHREAD_ONCE_INIT; static int started;
+		if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, wait_dump_thread, NULL); pthread_detach(th); }
+		(void)once;
+		for (int i = 0; i < 256; i++) { long z = 0; if (__atomic_compare_exchange_n(&wait_tab[i].tid, &z, (long)syscall(SYS_gettid), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { wslot = i; wait_tab[i].addr = addr; wait_tab[i].expect = expect; wait_tab[i].op = c->a[0]; break; } }
+	}
+	_Atomic int* wc = &ulock_waiters[((uintptr_t)addr >> 2) & 1023];
+	atomic_fetch_add(wc, 1);
 	long r = syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expect, tp, NULL, 0);
-	if (r == 0) return 0;
+	int others = atomic_fetch_sub(wc, 1) - 1;
+	if (wslot >= 0) wait_tab[wslot].tid = 0;
+	if (r == 0) return others > 0 ? others : 0;
 	switch (errno) {
 	case EAGAIN: return 0;                       // el valor ya cambió: no hay que esperar
 	case ETIMEDOUT: return -60;                  // ETIMEDOUT de Darwin
@@ -774,6 +808,7 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 static long bsd_ulock_wait(struct ctx* c)  { return ulock_wait_impl(c, (uint64_t)(uint32_t)c->a[3] * 1000ULL); }   // plazo en microsegundos
 static long bsd_ulock_wait2(struct ctx* c) { return ulock_wait_impl(c, c->a[3]); }                                 // plazo en nanosegundos
 static long bsd_ulock_wake(struct ctx* c) {
+	if (g_watch) { uint64_t m[8] = { 0 }; safe_read(c->a[1] - 24, m, 64); logf_("    WATCH ulock_wake op=0x%lx %p mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", c->a[0], (void*)c->a[1], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); }
 	if (c->a[0] & 0x1000000) c->raw_ret = 1;
 	long n = syscall(SYS_futex, (uint32_t*)c->a[1], FUTEX_WAKE_PRIVATE, (c->a[0] & 0x100) ? 0x7fffffff : 1, NULL, NULL, 0);
 	return n > 0 ? 0 : -D_ENOENT;

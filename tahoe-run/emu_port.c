@@ -116,7 +116,7 @@ static void poke(uint32_t name, int32_t rpid) {
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	int n = snprintf(a.sun_path + 1, sizeof a.sun_path - 1, "tahoe.%s.%u.%d", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x", name, (int)rpid);
 	char b = 1;
-	if (sendto(s, &b, 1, 0, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0) {}
+	if (sendto(s, &b, 1, 0, (struct sockaddr*)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + n)) < 0 && mach_trace()) logf_("    poke 0x%x -> pid %d FALLÓ: %s\n", name, (int)rpid, strerror(errno));
 	close(s);
 }
 // Vacía todos los avisos pendientes del socket: el aviso es un nivel ("hay mensajes"), no un contador; la cola de datagramas
@@ -159,6 +159,7 @@ int port_eventfd(uint32_t name) {
 			if (local_sock[i] >= 0) close(local_sock[i]);
 			p->rpid = (int32_t)getpid();
 			local_sock[i] = make_wake_socket(name, p->rpid);
+			if (mach_trace()) logf_("    puerto 0x%x: socket de aviso para pid %d fd=%d\n", name, (int)p->rpid, local_sock[i]);
 			if (p->count) poke(name, p->rpid);                              // ya hay mensajes: despertar de inmediato
 		}
 		r = local_sock[i];

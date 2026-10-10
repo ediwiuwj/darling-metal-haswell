@@ -7,6 +7,7 @@
 // Aquí el "kernel" es este proceso: cada identificador de mensaje se atiende en una función. Lo que no se
 // conozca recibe la respuesta estándar de MIG "identificador erróneo" (MIG_BAD_ID) y se registra.
 #define _GNU_SOURCE
+#include <sys/syscall.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -354,10 +355,11 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t rcv_name, uint32_t rcvsize) {
 	int timeout = (options & 0x100) ? (int)ctx_arg(c, 7) : -1;
 	if (trace_all && timeout < 0 && getenv("TAHOE_STACKS")) diag_crash(c->uc);   // quién se bloquea esperando
+	if (g_watch) logf_("    WATCH recv espera puerto 0x%x plazo=%d opciones=0x%lx\n", rcv_name, timeout, options);
 	long r = mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
-		logf_("    MT pid=%d recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), rcv_name, r, (int32_t)hh[5], hh[1]);
+		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
 		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_crash(c->uc);
 	}
 	return r;
@@ -407,7 +409,8 @@ static long mach_msg2(struct ctx* c) {
 	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
-	if (mtr) logf_("    MT pid=%d %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
+	if (mtr) logf_("    MT pid=%d.%ld %s dest=0x%x(->%d) resp=0x%x id=%d size=%u rcv=%d\n", (int)getpid(), (long)syscall(SYS_gettid), kobject ? "kobj" : "send", h.remote, kobject ? 0 : port_rpid(h.remote), h.local, h.id, ssize, (options & 2) != 0);
+	if (mtr && !kobject) { char s[200] = ""; size_t k = 0, run = 0; for (uint32_t q = 24; q < ssize && k < sizeof s - 2; q++) { uint8_t ch = req[q]; if (ch >= 0x20 && ch < 0x7f) { s[k++] = (char)ch; run++; } else { if (run >= 6) s[k++] = 0x7c; else k -= run; run = 0; } } if (run < 6) k -= run; s[k] = 0; if (k) logf_("      MT textos: %s\n", s); }
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
