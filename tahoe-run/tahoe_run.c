@@ -784,8 +784,12 @@ void reenable_dispatch(void) {
 extern __thread uint32_t g_thread_port;
 void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
 	g_thread_port = (uint32_t)a1;
-	stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
-	if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
+	static __thread int alt_ready;                       // un hilo reutilizado vuelve a entrar: la pila alterna se crea una sola vez
+	if (!alt_ready) {
+		stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
+		if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
+		alt_ready = 1;
+	}
 	reenable_dispatch();
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
 	register uint64_t r8 __asm__("r8") = a4, r9 __asm__("r9") = a5, r10 __asm__("r10") = rsp;

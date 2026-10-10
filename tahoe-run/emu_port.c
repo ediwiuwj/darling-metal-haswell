@@ -380,6 +380,16 @@ static long t_construct(struct ctx* c) {
 }
 // Los nombres de puerto son globales, pero en Mach cada tarea tiene los suyos: quien suelta su derecho de ENVÍO no debe destruir el
 // puerto del receptor. Solo el dueño del derecho de recepción (el creador, o quien lo recibió con MOVE_RECEIVE) puede destruirlo.
+// Vacía el aviso de un puerto sin mensajes (o inexistente): evita que un aviso viejo mantenga legible el descriptor y
+// el kqueue vuelva a despertar sin fin. Devuelve 1 si el puerto ya no existe.
+int port_drain_idle(uint32_t name) {
+	lock(); struct sport* p = find_locked(name);
+	int gone = p == NULL, fd = p ? local_sock[port_index(p)] : -1, cnt = p ? p->count : 0;
+	unlock();
+	if (!cnt) drain_all(fd);
+	return gone;
+}
+int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
 static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) p->owner = (int32_t)getpid(); unlock(); }
 static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto

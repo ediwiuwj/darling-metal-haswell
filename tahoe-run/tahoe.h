@@ -1,5 +1,6 @@
 // Interfaz común entre el núcleo de tahoe-run y los módulos de emulación (emu_*.c).
 #pragma once
+#include <unistd.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -47,6 +48,9 @@ void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
 int port_exists(uint32_t name);
+static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
+int port_rpid(uint32_t name);
+int port_drain_idle(uint32_t name);
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);

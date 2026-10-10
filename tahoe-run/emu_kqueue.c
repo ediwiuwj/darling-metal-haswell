@@ -145,7 +145,7 @@ static void knote_set_enabled(struct knote* n, int en) {
 
 // Aplica un cambio; devuelve 0 o un errno de Darwin.
 static int apply(int kq, const struct kev* c) {
-	if (trace_all && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
+	if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
 	struct knote* n = find(kq, c->ident, c->filter);
 	if (c->flags & EV_DELETE) { if (!n) return D_ENOENT; drop(n); return 0; }
 	if (!n) {
@@ -199,7 +199,7 @@ static int apply(int kq, const struct kev* c) {
 			int pfd = port_eventfd((uint32_t)c->ident);
 			if (pfd < 0) { logf_("    kevent: EVFILT_MACHPORT 0x%lx: puerto desconocido o de otro proceso\n", c->ident); break; }
 			n->fd = pfd;
-			if (trace_all) logf_("    kevent: EVFILT_MACHPORT puerto=0x%lx flags=0x%x fflags=0x%x udata=0x%lx kq=%d\n", c->ident, c->flags, c->fflags, c->udata, kq);
+			if (trace_all || mach_trace()) logf_("    kevent: EVFILT_MACHPORT puerto=0x%lx flags=0x%x fflags=0x%x udata=0x%lx kq=%d\n", c->ident, c->flags, c->fflags, c->udata, kq);
 			ev.events = EPOLLIN;
 			epoll_ctl(kq, EPOLL_CTL_ADD, pfd, &ev);
 			break;
@@ -211,7 +211,7 @@ static int apply(int kq, const struct kev* c) {
 			logf_("    kevent: filtro %d (ident=0x%lx flags=0x%x fflags=0x%x data=%ld ext=%lx,%lx,%lx,%lx) registrado sin efecto\n", c->filter, c->ident, c->flags, c->fflags, (long)c->data, c->ext[0], c->ext[1], c->ext[2], c->ext[3]);
 		}
 	} else {
-		if (trace_all && c->filter == EVFILT_MACHPORT) logf_("    kevent: actualiza MACHPORT 0x%lx flags=0x%x fflags=0x%x (activo antes=%d)\n", c->ident, c->flags, c->fflags, n->enabled);
+		if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: actualiza MACHPORT 0x%lx flags=0x%x fflags=0x%x (activo antes=%d)\n", c->ident, c->flags, c->fflags, n->enabled);
 		n->k.udata = c->udata;
 		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
 	}
@@ -275,7 +275,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 	for (int i = 0; i < r; i++) {
 		struct knote* n = es[i].data.ptr;
 		if (!knote_alive(n)) continue;                                   // lo eliminó otro hilo tras epoll_wait
-		if (trace_all && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (activo=%d, dout=%d)\n", n->k.ident, n->enabled, g_dout != 0);
+		if ((trace_all || mach_trace()) && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (activo=%d, dout=%d)\n", n->k.ident, n->enabled, g_dout != 0);
 		if (!n->enabled) continue;
 		struct kev k = n->k;
 		k.flags &= (uint16_t)~(EV_ADD | EV_ENABLE | EV_DISABLE | EV_DELETE | EV_RECEIPT | 0x200 /*EV_VANISHED*/);   // el kernel no repite las banderas de registro
@@ -288,7 +288,11 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				safe_read(g_davail, &avail, 8);
 				uint32_t total = 0;
 				long rr = avail ? mach_rx_message((uint32_t)n->k.ident, 0, n->k.fflags, g_dout, (uint32_t)avail, &total) : 0x10004004;
-				if (rr) { if (trace_all || (rr & 0xffffc000) != 0x10004000) logf_("    kevent: recepción directa en 0x%lx devolvió 0x%lx\n", n->k.ident, rr); if (rr == 0x10004003) continue; k.fflags = (uint32_t)rr; }
+				if (rr) { if (trace_all || mach_trace() || (rr & 0xffffc000) != 0x10004000) logf_("    kevent: recepción directa en 0x%lx devolvió 0x%lx\n", n->k.ident, rr); if (rr == 0x10004003 || rr == 0x10004008 || rr == 0x10004009) {   // sin mensaje / puerto inexistente o muerto: el aviso sobraba
+						if (port_drain_idle((uint32_t)n->k.ident) && n->fd >= 0) { epoll_ctl(n->kq, EPOLL_CTL_DEL, n->fd, NULL); n->fd = -1; }
+						continue;
+					}
+					k.fflags = (uint32_t)rr; }
 				else {
 					k.fflags = 0;                                  // resultado de mach_msg: éxito (no las banderas pedidas)
 					k.ext[0] = g_dout; k.ext[1] = total;

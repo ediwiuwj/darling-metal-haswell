@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <spawn.h>
 #include <poll.h>
+#include <setjmp.h>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include "tahoe.h"
@@ -503,11 +504,13 @@ static long bsd_bsdthread_create(struct ctx* c) {
 	pthread_t th;
 	int e = pthread_create(&th, &at, thread_main, t);
 	if (e) { free(t); return -35 /* EAGAIN de Darwin */; }
+	if (mach_trace()) logf_("    THR <%d> crea hilo func=0x%lx arg=0x%lx\n", (int)getpid(), c->a[0], c->a[1]);
 	if (trace_all) logf_("    bsdthread_create: pthread=0x%lx stack=0x%lx flags=0x%lx\n", c->a[3], c->a[2], c->a[4]);
 	return (long)c->a[3];
 }
 // bsdthread_terminate(stackaddr, freesize, port, sem): libera la pila del hilo y termina solo este hilo.
 static long bsd_bsdthread_terminate(struct ctx* c) {
+	if (mach_trace()) logf_("    THR <%d> termina hilo\n", (int)getpid());
 	if (c->a[0] && c->a[1]) munmap((void*)c->a[0], c->a[1]);
 	syscall(SYS_exit, 0);
 	return 0;
@@ -525,7 +528,7 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 #define WQ_WORKLOOP   0x00400000u
 #define WQ_STACK      (1u << 20)
 static __thread uint64_t my_workloop;   // workloop que atiende este hilo
-struct wq_job { uint64_t kqid; int workloop, has_req; uint8_t req[72]; };
+struct wq_job { uint64_t kqid; int workloop, has_req; uint8_t req[72]; struct wq_job* next; };
 struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };
 extern int kq_workloop_fd(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
@@ -543,38 +546,88 @@ static int req_still_valid(const uint8_t* req) {
 static struct wl_state* wl_states;
 static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void* wq_main(void* p) {
-	struct wq_job j = *(struct wq_job*)p;
-	free(p);
-	size_t psize = pthread_size ? pthread_size : 0x2000;
-	uint8_t* base = mmap(NULL, WQ_STACK + psize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (base == MAP_FAILED) return NULL;
+// Hilos de las colas de trabajo: un grupo reutilizable. Cuando libpthread "aparca" un hilo (workq_kernreturn) no se
+// termina: se vuelve a la función del anfitrión con siglongjmp y el hilo espera la siguiente petición. Así las pilas
+// (la del anfitrión, la del invitado y la alterna de SIGSYS) se crean una vez y no se fugan, y un bucle de peticiones
+// no puede crear hilos sin límite: pasado WQ_MAX_HILOS las peticiones esperan en cola.
+#define WQ_MAX_HILOS 48
+#define WQ_IDLE_MS   4000
+static pthread_mutex_t wq_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wq_pool_cv = PTHREAD_COND_INITIALIZER;
+static struct wq_job* wq_queue_head; static struct wq_job** wq_queue_tail = &wq_queue_head;
+static int wq_live, wq_idle;
+static __thread sigjmp_buf wq_park;
+static __thread int wq_park_ok;
+
+static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize) {
+	struct wq_job j = *jp;
 	uint64_t self = (uint64_t)base + WQ_STACK;
+	memset(base + WQ_STACK - 0x3000, 0, 0x3000 + psize);          // pthread_t y cabecera limpios para el nuevo servicio
 	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
 	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
 	int nev = 0;
 	my_workloop = j.workloop ? j.kqid : 0;
+	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= WQ_WORKLOOP | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
-		// búfer de datos (32 KB) para los mensajes Mach que el kernel entrega junto a los eventos
-		uint8_t* data = mmap(NULL, 32768 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (!data) data = mmap(NULL, 32768 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		uint64_t* avail = (uint64_t*)(data + 32768);
 		*avail = 32768;
 		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
 		if (d > 0) nev += (int)d; }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
-	enter_guest_thread(wqthread_fn, self - 0x3000, self, alloc_port(), (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
+	if (sigsetjmp(wq_park, 1) == 0) {
+		wq_park_ok = 1;
+		enter_guest_thread(wqthread_fn, self - 0x3000, self, alloc_port(), (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
+	}
+	wq_park_ok = 0;                                                  // volvió el hilo aparcado
+}
+
+static void* wq_main(void* p) {
+	struct wq_job* first = p;
+	size_t psize = pthread_size ? pthread_size : 0x2000;
+	uint8_t* base = mmap(NULL, WQ_STACK + psize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	struct wq_job* job = first;
+	if (base == MAP_FAILED) { free(first); pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); return NULL; }
+	for (;;) {
+		wq_run_job(job, base, psize);
+		free(job);
+		pthread_mutex_lock(&wq_pool_lock);
+		job = NULL;
+		for (;;) {
+			if (wq_queue_head) { job = wq_queue_head; wq_queue_head = job->next; if (!wq_queue_head) wq_queue_tail = &wq_queue_head; break; }
+			struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+			dl.tv_sec += WQ_IDLE_MS / 1000; dl.tv_nsec += (WQ_IDLE_MS % 1000) * 1000000L; if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+			wq_idle++;
+			int rc = pthread_cond_timedwait(&wq_pool_cv, &wq_pool_lock, &dl);
+			wq_idle--;
+			if (rc && !wq_queue_head) break;                         // sin trabajo tras esperar: el hilo termina
+		}
+		if (!job) { wq_live--; pthread_mutex_unlock(&wq_pool_lock); break; }
+		pthread_mutex_unlock(&wq_pool_lock);
+	}
+	munmap(base, WQ_STACK + psize);
+	return NULL;
 }
 
 static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
 	struct wq_job* j = calloc(1, sizeof *j);
 	j->kqid = kqid; j->workloop = workloop;
 	if (req) { j->has_req = 1; memcpy(j->req, req, 72); }
+	pthread_mutex_lock(&wq_pool_lock);
+	if (wq_idle > 0 || wq_live >= WQ_MAX_HILOS) {                  // un hilo libre la atiende, o espera turno
+		*wq_queue_tail = j; wq_queue_tail = &j->next;
+		pthread_cond_signal(&wq_pool_cv);
+		pthread_mutex_unlock(&wq_pool_lock);
+		return;
+	}
+	wq_live++;
+	pthread_mutex_unlock(&wq_pool_lock);
 	pthread_attr_t at; pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 1 << 20);
 	pthread_t th;
-	if (pthread_create(&th, &at, wq_main, j)) free(j);
+	if (pthread_create(&th, &at, wq_main, j)) { free(j); pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); }
 }
 
 // Petición de hilo para un workloop (EVFILT_WORKLOOP con NOTE_WL_THREAD_REQUEST). Un solo hilo por workloop a la vez.
@@ -663,6 +716,7 @@ static long bsd_workq_kernreturn(struct ctx* c) {
 		}
 		if (op == 0x100 && (long)(int)c->a[2] > 0) kq_apply_changes(2, c->a[1], (long)(int)c->a[2], my_workloop);
 		if (op == 0x100 && my_workloop) wl_finished(my_workloop);
+		if (wq_park_ok) siglongjmp(wq_park, 1);                    // aparcar = volver al grupo de hilos
 		syscall(SYS_exit, 0);
 		return 0;
 	}
@@ -700,6 +754,13 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	struct timespec ts, *tp = NULL;
 	if (timeout_ns) { ts.tv_sec = timeout_ns / 1000000000ULL; ts.tv_nsec = timeout_ns % 1000000000ULL; tp = &ts; }
 	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
+	if (mach_trace()) {                          // diagnóstico: pila de cada hilo que se bloquea sin plazo en el proceso indicado por /dev/shm/tahoe-stacks
+		static int want = -1;
+		if (want < 0) { char nm[64] = "", cl[512] = ""; FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
+			f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+			want = nm[0] && strstr(cl, nm); }
+		if (want && !timeout_ns) { logf_("    ULW <%d:%ld> %p esperado=0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect); diag_crash(c->uc); }
+	}
 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
 	long r = syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expect, tp, NULL, 0);
 	if (r == 0) return 0;
