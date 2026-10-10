@@ -367,3 +367,29 @@ abortaba. Ahora se soporta (más cabecera auxiliar vacía al recibir). Además: 
 comprueba `rootless_mkdir_protected`), un kevent de puerto sin recepción directa devuelve `fflags=0`, y varias syscalls menores
 (`lchown`, `getxattr`, `gethostuuid`, `auditon`). Quedan `amfid` (SIGSEGV en el arranque de dyld) y WindowServer, que sale con código 1 al
 no poder abrir el cliente de usuario de `IOHIDSystem`.
+
+### Bases más sólidas (10 de octubre de 2026)
+Estado actual: `launchd` arranca unos 40 procesos y ~20–24 servicios con nombre siguen vivos; la memoria se mantiene estable
+(~0,9 GB anónimos). Cambios de fondo, buscando la semántica exacta de XNU y libdispatch:
+- **kqueue**: un registro de epoll por (kqueue, descriptor) con la unión del interés de los knotes que lo comparten (READ y WRITE del
+  mismo socket, varios knotes `EV_UDATA_SPECIFIC` del mismo puerto); el dato del registro es el descriptor, nunca un puntero.
+  Rearmar un knote existente actualiza sus parámetros (`f_touch`); `EV_ONESHOT` con `EV_DISPATCH2` queda en borrado diferido
+  (`KN_DEFERDELETE`, `EINPROGRESS`, evento falso `EV_DELETE|EV_ONESHOT`). La recepción directa rellena `ext[]` como XNU.
+- **Workloops y colas de trabajo**: un vigilante fijo por workloop recoge los eventos antes de lanzar hilo (sin despertares en vacío);
+  los hilos se reutilizan con `WQ_FLAG_THREAD_REUSE` y mueren por la vía de libpthread (`nkevents = -1`), sin fugas de pila y con
+  tope; se vigila también el kqueue de la cola (`kevent_qos` con kq = -1). Espera síncrona de `dispatch_sync`
+  (`NOTE_WL_SYNC_WAIT/WAKE/END`) con comprobación ESTALE.
+- **Sincronización**: `ulock_wait` devuelve el número exacto de esperadores restantes (si no, `os_unfair_lock` pierde despertares y
+  libdispatch aborta); `psynch` (mutex fairshare y condiciones); `thread_switch`.
+- **Mach**: códigos de `mach_msg` corregidos (`MACH_RCV_INVALID_NAME` = 0x10004002), contexto del puerto en el trailer
+  (`construct`, `get/set_context`, `guard`), `mach_port_names`, `thread_info`, envíos no encolados devuelven error.
+- **Sistema**: derechos (entitlements) leídos de la firma de código real del ejecutable (`csops` 7/11/14/16, `csops_audittoken`);
+  `getattrlist` con atributos de volumen y comunes extendidos; `fcntl` con equivalentes nativos; semáforos POSIX con nombre sobre los
+  de Linux; información de procesos desde `/proc`; al arrancar se copia lo que falte de `System/Library/Templates/Data` (base de
+  usuarios dslocal...); plano `IOPower` en IOKit.
+- **Diagnóstico**: los mensajes de aborto se leen de la sección `__crash_info` de todas las imágenes y del ejecutable; trazas
+  dirigidas activables con archivos en `/dev/shm` (`tahoe-mach-trace`, `tahoe-stacks`, `tahoe-waittab`, `tahoe-watch-func`).
+
+**Pendiente**: `remoted` (respuesta XPC asíncrona entregada sin contexto), clientes de CarbonCore que no conectan con `coreservicesd`
+(MIG -300), `configd` (cola nula al cargar plugins), `powerd` (necesita el servicio HID de WindowServer), señales reales (`sigreturn`),
+`fileport_makeport`. Después: WindowServer (ya pasa `CA::Render::Server::start`), pantalla por DRM/KMS, entrada por evdev y Metal.
