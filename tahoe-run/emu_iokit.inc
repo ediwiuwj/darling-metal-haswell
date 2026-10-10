@@ -275,11 +275,12 @@ static struct val* any_parse(const uint8_t* p, size_t len) {
 
 // ------------------------------------------------------------------ el registro
 #define IO_MAXENT 96
-enum { PL_SERVICE = 1, PL_DT = 2 };
+enum { PL_SERVICE = 1, PL_DT = 2, PL_POWER = 4 };   // planos (máscara): IOService, IODeviceTree, IOPower
 struct ioent {
 	const char* name; const char* cls; const char* supers;   // supers: nombres separados por espacios, de la más cercana a la raíz
 	char loc[24];
 	int parent; int planes; int uc;                          // uc: admite conexiones (user client)
+	int pparent;                                             // padre en el plano IOPower si difiere del de IOService (-2: el mismo)
 	uint64_t id; struct val* props; int busy;
 };
 static struct ioent io_e[IO_MAXENT];
@@ -290,7 +291,7 @@ static uint64_t io_next_id = 0x100000100ULL;
 static int ent_add(int parent, const char* name, const char* cls, const char* supers, const char* loc, int planes, int uc) {
 	int i = io_ne++;
 	struct ioent* e = &io_e[i];
-	e->name = name; e->cls = cls; e->supers = supers; e->parent = parent; e->planes = planes; e->uc = uc;
+	e->name = name; e->cls = cls; e->supers = supers; e->parent = parent; e->planes = planes; e->uc = uc; e->pparent = -2;
 	snprintf(e->loc, sizeof e->loc, "%s", loc ? loc : "");
 	e->id = io_next_id; io_next_id += 0x10;
 	e->props = v_new(V_DICT);
@@ -323,7 +324,7 @@ static void io_init(void) {
 	long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 	uint64_t mem = (uint64_t)sysconf(_SC_PHYS_PAGES) * (uint64_t)sysconf(_SC_PAGESIZE);
 
-	int root = ent_add(-1, "Root", "IORegistryEntry", "", "", PL_SERVICE | PL_DT, 0);
+	int root = ent_add(-1, "Root", "IORegistryEntry", "", "", PL_SERVICE | PL_DT | PL_POWER, 0);
 	p_str(root, "IORegistryPlanes", "IOService");
 	int plat = ent_add(root, "MacBookPro16,1", "IOPlatformExpertDevice", "IORegistryEntry IOService", "", PL_SERVICE | PL_DT, 1);
 	p_cstr(plat, "name", "/");
@@ -348,7 +349,10 @@ static void io_init(void) {
 
 	int acpi = ent_add(plat, "AppleACPIPlatformExpert", "AppleACPIPlatformExpert", "IORegistryEntry IOService IOPlatformExpert", "", PL_SERVICE, 1);
 	p_str(acpi, "IOClass", "AppleACPIPlatformExpert");
-	int pm = ent_add(acpi, "IOPMrootDomain", "IOPMrootDomain", "IORegistryEntry IOService", "", PL_SERVICE, 1);
+	int pm = ent_add(acpi, "IOPMrootDomain", "IOPMrootDomain", "IORegistryEntry IOService", "", PL_SERVICE | PL_POWER, 1);
+	// Plano IOPower: Root -> IOPowerConnection -> IOPMrootDomain (IORegisterForSystemPower busca "IOPower:/IOPowerConnection/IOPMrootDomain")
+	int pconn = ent_add(root, "IOPowerConnection", "IOPowerConnection", "IORegistryEntry IOService", "", PL_POWER, 0);
+	io_e[pm].pparent = pconn;
 	p_str(pm, "IOClass", "IOPMrootDomain");
 	int res = ent_add(root, "IOResources", "IOResources", "IORegistryEntry IOService", "", PL_SERVICE, 0);
 	p_str(res, "IOClass", "IOResources");
@@ -428,7 +432,7 @@ static void io_init(void) {
 }
 
 static int ent_in(int i, int plane) { return io_e[i].planes & plane; }
-static int ent_parent(int i, int plane) { int p = io_e[i].parent; while (p >= 0 && !ent_in(p, plane)) p = io_e[p].parent; return p; }
+static int ent_parent(int i, int plane) { if (plane == PL_POWER && io_e[i].pparent != -2) return io_e[i].pparent; int p = io_e[i].parent; while (p >= 0 && !ent_in(p, plane)) p = io_e[p].parent; return p; }
 static int ent_conforms(int i, const char* cls) {
 	if (!strcmp(io_e[i].cls, cls)) return 1;
 	const char* s = io_e[i].supers;
@@ -442,7 +446,7 @@ static int ent_conforms(int i, const char* cls) {
 	}
 	return 0;
 }
-static int plane_of(const char* name) { return !strcmp(name, "IODeviceTree") ? PL_DT : !strcmp(name, "IOService") ? PL_SERVICE : 0; }
+static int plane_of(const char* name) { return !strcmp(name, "IODeviceTree") ? PL_DT : !strcmp(name, "IOService") ? PL_SERVICE : !strcmp(name, "IOPower") ? PL_POWER : 0; }
 static const char* ent_name_in_plane(int i, int plane) {
 	if (plane == PL_DT && io_e[i].parent == -1) return "Root";
 	if (plane == PL_DT) { struct val* n = v_get(io_e[i].props, "name"); if (n && n->t == V_DATA) return n->s; }

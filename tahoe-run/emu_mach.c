@@ -363,6 +363,7 @@ static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t
 	if (access("/dev/shm/tahoe-mach-trace", F_OK) == 0) {
 		uint32_t hh[6] = { 0 }; if (r == 0) safe_read(buf, hh, 24);
 		logf_("    MT pid=%d.%ld recv port=0x%x r=0x%lx id=%d size=%u\n", (int)getpid(), (long)syscall(SYS_gettid), rcv_name, r, (int32_t)hh[5], hh[1]);
+		if (r == 0 && hh[1] <= 64 && hh[1] >= 24) { uint32_t w[16] = { 0 }; safe_read(buf, w, hh[1]); logf_("      MT bytes:"); for (uint32_t q = 0; q < hh[1] / 4; q++) logf_(" %08x", w[q]); logf_("\n"); }
 		if (r == 0x10004003 && access("/dev/shm/tahoe-stacks", F_OK) == 0) diag_crash(c->uc);
 	}
 	return r;
@@ -428,6 +429,27 @@ static long mach_msg2(struct ctx* c) {
 	switch (h.id) {
 	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
 	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
+	case 3207: case 3457: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // mach_port_deallocate (MIG): soltar un derecho de envío no destruye nada / task_set_mach_voucher
+	case 3419: n = reply_begin(rep, &h, 5 /* KERN_FAILURE */); break;       // task_swap_exception_ports: sin puertos de excepción
+	case 3200: {                                                  // mach_port_names(task) -> names[], types[] (dos OOL)
+		static uint32_t nm[2048], ty[2048];
+		int cnt = port_list_owned(nm, ty, 2048);
+		struct hdr nh = { .bits = 0x80000000u, .size = 0, .remote = 0, .local = 0, .voucher = 0, .id = h.id + 100 };
+		memcpy(rep, &nh, sizeof nh);
+		uint32_t two = 2; memcpy(rep + 24, &two, 4);
+		size_t off = 28;
+		const uint32_t* arrs[2] = { nm, ty };
+		for (int k = 0; k < 2; k++) {
+			uint64_t addr = 0; size_t len = (size_t)cnt * 4;
+			if (len) { void* mm = mmap(NULL, (len + 4095) & ~4095ul, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); if (mm != MAP_FAILED) { memcpy(mm, arrs[k], len); addr = (uint64_t)mm; } else len = 0; }
+			uint8_t dsc[16] = { 0 }; memcpy(dsc, &addr, 8); dsc[8] = 1; dsc[9] = 1; dsc[11] = 1; uint32_t l32 = (uint32_t)len; memcpy(dsc + 12, &l32, 4);
+			memcpy(rep + off, dsc, 16); off += 16;
+		}
+		memcpy(rep + off, NDR_LE, 8); off += 8;
+		uint32_t c32 = (uint32_t)cnt; memcpy(rep + off, &c32, 4); off += 4; memcpy(rep + off, &c32, 4); off += 4;
+		n = off;
+		break;
+	}
 	case 3612: {                                                  // thread_info(hilo, flavor, cuenta) -> info[cuenta]
 		uint32_t flavor, cnt; memcpy(&flavor, req + 32, 4); memcpy(&cnt, req + 36, 4);
 		uint32_t info[32] = { 0 }; uint32_t outc = 0;

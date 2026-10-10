@@ -92,7 +92,7 @@ static long bsd_utimes(struct ctx* c) {       // struct timeval de Darwin: {i64 
 	}
 	RET(utimensat(AT_FDCWD, p, NULL, 0));
 }
-static long bsd_gettid(struct ctx* c) { (void)c; return -D_EINVAL; }   // sin uid/gid por hilo
+static long bsd_gettid(struct ctx* c) { (void)c; return -3; }   // ESRCH: el hilo no tiene identidad propia (como XNU sin UT_SETUID)
 static long bsd_getgroups(struct ctx* c) {
 	int n = (int)c->a[0];
 	gid_t g[64];

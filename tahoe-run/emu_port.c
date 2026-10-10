@@ -398,6 +398,19 @@ int port_drain_idle(uint32_t name) {
 }
 uint64_t port_get_context(uint32_t name) { lock(); struct sport* p = find_locked(name); uint64_t r = p ? p->ctx : 0; unlock(); return r; }
 int port_set_context(uint32_t name, uint64_t v) { lock(); struct sport* p = find_locked(name); if (p) p->ctx = v; unlock(); return p != NULL; }
+// Puertos con derecho de recepción de este proceso (mach_port_names): nombre y tipo (RECEIVE|SEND o PORT_SET).
+int port_list_owned(uint32_t* names, uint32_t* types, int max) {
+	int n = 0;
+	lock();
+	for (int i = 0; i < MAXPORTS && n < max; i++) {
+		struct sport* s = &shm->ports[i];
+		if (!s->used || s->rpid != (int32_t)getpid()) continue;
+		names[n] = s->name; types[n] = s->is_set ? (1u << 19) : ((1u << 17) | (1u << 16));
+		n++;
+	}
+	unlock();
+	return n;
+}
 int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
 static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) p->owner = (int32_t)getpid(); unlock(); }

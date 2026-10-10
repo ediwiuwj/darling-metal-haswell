@@ -608,6 +608,66 @@ static long bsd_terminate_with_payload(struct ctx* c) {
 // csrctl: consulta de SIP. op 0 = CSR_SYSCALL_CHECK; 0 significa "permitido" (como con SIP desactivado).
 static long bsd_csrctl(struct ctx* c) { (void)c; return 0; }
 // proc_info: dyld usa la llamada 15 (SET_DYLD_IMAGES) para informar al kernel de las imágenes cargadas.
+// Datos de un proceso desde /proc (nativo). El nombre es el del ejecutable de macOS (tahoe-run <caché> <dyld> <exe>).
+struct pinfo { int pid, ppid, pgid, status, uid, gid, ruid, rgid, svuid, svgid, nfiles; char comm[17], name[33]; uint64_t start_sec, start_usec; };
+static int proc_snapshot(int pid, struct pinfo* o) {
+	memset(o, 0, sizeof *o);
+	if (pid <= 0) pid = getpid();
+	char p[64], b[4096];
+	snprintf(p, sizeof p, "/proc/%d/stat", pid);
+	int fd = open(p, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return -1;
+	ssize_t n = read(fd, b, sizeof b - 1); close(fd);
+	if (n <= 0) return -1;
+	b[n] = 0;
+	char* q = strrchr(b, ')');
+	if (!q) return -1;
+	char st = 0; unsigned long long start = 0; int ppid = 0, pgid = 0;
+	// campos tras ")": estado ppid pgrp sesión tty tpgid flags ... (22: starttime)
+	sscanf(q + 2, "%c %d %d %*d %*d %*d %*u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu", &st, &ppid, &pgid, &start);
+	o->pid = pid; o->ppid = ppid; o->pgid = pgid;
+	o->status = st == 'Z' ? 5 : st == 'T' ? 4 : st == 'R' ? 2 : 3;          // SZOMB / SSTOP / SRUN / SSLEEP
+	long hz = sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+	struct timespec now, up; clock_gettime(CLOCK_REALTIME, &now); clock_gettime(CLOCK_BOOTTIME, &up);
+	double boot = (double)now.tv_sec + now.tv_nsec / 1e9 - (up.tv_sec + up.tv_nsec / 1e9), s = boot + (double)start / (double)hz;
+	o->start_sec = (uint64_t)s; o->start_usec = (uint64_t)((s - (double)(uint64_t)s) * 1e6);
+	snprintf(p, sizeof p, "/proc/%d/status", pid);
+	FILE* f = fopen(p, "r");
+	if (f) {
+		char ln[256];
+		while (fgets(ln, sizeof ln, f)) {
+			if (!strncmp(ln, "Uid:", 4)) sscanf(ln + 4, "%d %d %d", &o->ruid, &o->uid, &o->svuid);
+			else if (!strncmp(ln, "Gid:", 4)) sscanf(ln + 4, "%d %d %d", &o->rgid, &o->gid, &o->svgid);
+		}
+		fclose(f);
+	}
+	snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+	fd = open(p, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		n = read(fd, b, sizeof b - 1); close(fd);
+		if (n > 0) {
+			b[n] = 0;
+			const char* a = b; int i = 0;
+			while (a < b + n && i < 3) { a += strlen(a) + 1; i++; }
+			if (a < b + n) { const char* base = strrchr(a, '/'); base = base ? base + 1 : a; snprintf(o->comm, sizeof o->comm, "%s", base); snprintf(o->name, sizeof o->name, "%s", base); }
+		}
+	}
+	return 0;
+}
+// struct proc_bsdinfo (136 bytes) / proc_bsdshortinfo (64 bytes)
+static void put_bsdinfo(uint8_t* b, const struct pinfo* pi) {
+	memset(b, 0, 136);
+#define W32(off, v) do { uint32_t t_ = (uint32_t)(v); memcpy(b + (off), &t_, 4); } while (0)
+	W32(4, pi->status); W32(12, pi->pid); W32(16, pi->ppid); W32(20, pi->uid); W32(24, pi->gid); W32(28, pi->ruid); W32(32, pi->rgid);
+	W32(36, pi->svuid); W32(40, pi->svgid); memcpy(b + 48, pi->comm, 16); memcpy(b + 64, pi->name, 32); W32(100, pi->pgid); W32(112, pi->pgid);
+	memcpy(b + 120, &pi->start_sec, 8); memcpy(b + 128, &pi->start_usec, 8);
+}
+static void put_bsdshortinfo(uint8_t* b, const struct pinfo* pi) {
+	memset(b, 0, 64);
+	W32(0, pi->pid); W32(4, pi->ppid); W32(8, pi->pgid); W32(12, pi->status); memcpy(b + 16, pi->comm, 16);
+	W32(36, pi->uid); W32(40, pi->gid); W32(44, pi->ruid); W32(48, pi->rgid); W32(52, pi->svuid); W32(56, pi->svgid);
+#undef W32
+}
 static long bsd_proc_info(struct ctx* c) {
 	if ((int)c->a[0] == 15) return 0;
 	if ((int)c->a[0] == 5 || (int)c->a[0] == 8) return 0;                 // SETCONTROL / DIRTYCONTROL: sin efecto
@@ -616,22 +676,22 @@ static long bsd_proc_info(struct ctx* c) {
 		size_t n = c->a[5] < sizeof z ? c->a[5] : sizeof z;
 		return safe_write(c->a[4], z, n) == (ssize_t)n ? 0 : -D_EFAULT;
 	}
-	if ((int)c->a[0] == 2 && ((int)c->a[2] == 3 || (int)c->a[2] == 4)) {   // BSDINFO (136) / TASKINFO (96)
+	if ((int)c->a[0] == 2 && ((int)c->a[2] == 3 || (int)c->a[2] == 4 || (int)c->a[2] == 13)) {   // BSDINFO (136) / TASKINFO (96) / SHORTBSDINFO (64)
 		uint8_t b[136] = { 0 };
-		size_t want = (int)c->a[2] == 3 ? 136 : 96;
-		if ((int)c->a[2] == 3) {
-			uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();
-			memcpy(b + 12, &pid, 4); memcpy(b + 16, &ppid, 4); memcpy(b + 20, &uid, 4); memcpy(b + 24, &gid, 4);
-		}
+		size_t want = (int)c->a[2] == 3 ? 136 : (int)c->a[2] == 13 ? 64 : 96;
+		struct pinfo pi;
+		if (proc_snapshot((int)c->a[1], &pi) != 0) return -3;   // ESRCH
+		if ((int)c->a[2] == 3) put_bsdinfo(b, &pi);
+		else if ((int)c->a[2] == 13) put_bsdshortinfo(b, &pi);
 		if (c->a[5] < want) return -DARWIN_EINVAL;
 		return safe_write(c->a[4], b, want) == (ssize_t)want ? (long)want : -D_EFAULT;
 	}
 	if ((int)c->a[0] == 2 && ((int)c->a[2] == 17 || (int)c->a[2] == 18)) {   // PIDUNIQIDENTIFIERINFO / BSDINFOWITHUNIQID
 		uint8_t b[136 + 56] = { 0 };
-		uint32_t pid = (uint32_t)c->a[1], ppid = (uint32_t)getppid(), uid = getuid(), gid = getgid();
-		uint64_t uniq = pid;
-		memcpy(b + 12, &pid, 4); memcpy(b + 16, &ppid, 4);
-		memcpy(b + 20, &uid, 4); memcpy(b + 24, &gid, 4); memcpy(b + 28, &uid, 4); memcpy(b + 32, &gid, 4);
+		struct pinfo pi;
+		if (proc_snapshot((int)c->a[1], &pi) != 0) return -3;   // ESRCH
+		put_bsdinfo(b, &pi);
+		uint64_t uniq = (uint64_t)pi.pid;
 		size_t off = (int)c->a[2] == 18 ? 136 : 0, size = off + 56;
 		memcpy(b + 136 + 16, &uniq, 8);                     // p_uniqueid
 		if ((int)c->a[2] == 17) memcpy(b + 16, &uniq, 8);   // (en este sabor la estructura empieza en p_uuid)
@@ -775,6 +835,7 @@ static void on_sigsys(int sig, siginfo_t* si, void* v) {
 		if (num < BSD_NAMES_N && bsd_table[num]) { r = bsd_table[num](&c); verdict = "ok   "; }
 		else { r = -DARWIN_ENOSYS; verdict = "FALTA"; }
 		if (trace_all || g_watch || verdict[0] == 'F') log_call("bsd", num, name, &c, verdict);
+		else if (r < 0 && r > -4096 && !c.raw_ret && diag_target()) { char v[16]; snprintf(v, sizeof v, "E%-4ld", -r); log_call("bsd", num, name, &c, v); }   // diagnóstico: errores del proceso indicado
 		if (c.raw_ret) { g[REG_RAX] = (uint64_t)r; g[REG_EFL] &= ~1UL; }
 		else if (r < 0 && r > -4096) { g[REG_RAX] = -r; g[REG_EFL] |= 1; }   // error: rax = errno, CF = 1
 		else { g[REG_RAX] = r; g[REG_EFL] &= ~1UL; if (c.has_ret2) g[REG_RDX] = c.ret2; }

@@ -294,13 +294,13 @@ void diag_crash(ucontext_t* uc) {
 		crash_messages();
 		{
 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
-			uint64_t sk[512] = { 0 };
+			static __thread uint64_t sk[2048]; memset(sk, 0, sizeof sk);
 			ssize_t got = safe_read((uint64_t)uc->uc_mcontext.gregs[REG_RSP], sk, sizeof sk);
 			logf_("    abort <%d>: rip=0x%llx rsp=0x%llx rbp=0x%llx pila:", (int)getpid(), (unsigned long long)uc->uc_mcontext.gregs[REG_RIP], (unsigned long long)uc->uc_mcontext.gregs[REG_RSP], (unsigned long long)uc->uc_mcontext.gregs[REG_RBP]);
 			for (int k = 0; k < 14 && k < (int)(got / 8); k++) logf_(" %lx", sk[k]);
 			logf_("\n    abort: llamadas plausibles:");
 			int shown = 0;
-			for (int k = 0; k < (int)(got / 8) && shown < 12; k++) {
+			for (int k = 0; k < (int)(got / 8) && shown < 24; k++) {
 				uint64_t a = sk[k];
 				if (a < 0x7ff800000000UL || a >= 0x7ff820000000UL) continue;
 				uint8_t pre[6];

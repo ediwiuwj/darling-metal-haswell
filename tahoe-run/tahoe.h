@@ -58,6 +58,7 @@ uint32_t port_create(int is_set);
 int port_exists(uint32_t name);
 static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
 int port_rpid(uint32_t name);
+int port_list_owned(uint32_t* names, uint32_t* types, int max);
 uint64_t port_get_context(uint32_t name);
 int port_set_context(uint32_t name, uint64_t v);
 extern __thread int g_watch;
