@@ -717,6 +717,40 @@ static long bsd_mac_syscall(struct ctx* c) {
 	return 0;
 }
 
+
+// ---- volumen de datos: macOS crea el volumen Data a partir de /System/Library/Templates/Data (directorios de /private,
+// /Library, /Users... con sus permisos, y archivos como la base de usuarios dslocal). Aquí la raíz es un único árbol: al
+// arrancar el primer proceso se copia de la plantilla todo lo que falte, sin tocar lo que ya existe.
+#include <ftw.h>
+static char tmpl_root[4300];
+static size_t tmpl_len;
+static int tmpl_copy(const char* src, const struct stat* st, int type, struct FTW* fw) {
+	(void)fw;
+	char dst[8600];
+	snprintf(dst, sizeof dst, "%s%s", tahoe_root, src + tmpl_len);
+	if (!src[tmpl_len]) return 0;                                 // la propia plantilla
+	struct stat ds;
+	if (lstat(dst, &ds) == 0) return 0;                           // ya existe: no se sobrescribe
+	if (type == FTW_D) { if (mkdir(dst, st->st_mode & 07777) == 0) chmod(dst, st->st_mode & 07777); }
+	else if (type == FTW_SL) { char t[4096]; ssize_t n = readlink(src, t, sizeof t - 1); if (n > 0) { t[n] = 0; if (symlink(t, dst) != 0) {} } }
+	else if (type == FTW_F) {
+		int in = open(src, O_RDONLY | O_CLOEXEC), out = in < 0 ? -1 : open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, st->st_mode & 07777);
+		char b[65536]; ssize_t n;
+		while (in >= 0 && out >= 0 && (n = read(in, b, sizeof b)) > 0) if (write(out, b, (size_t)n) != n) break;
+		if (in >= 0) close(in);
+		if (out >= 0) close(out);
+	}
+	return 0;
+}
+void populate_data_volume(void) {
+	if (!tahoe_root) return;
+	snprintf(tmpl_root, sizeof tmpl_root, "%s/System/Library/Templates/Data", tahoe_root);
+	tmpl_len = strlen(tmpl_root);
+	struct stat st;
+	if (stat(tmpl_root, &st) != 0) return;
+	nftw(tmpl_root, tmpl_copy, 32, FTW_PHYS);
+}
+
 void emu_fs_init(void) {
 	reg_bsd(73, bsd_munmap);   reg_bsd(74, bsd_mprotect); reg_bsd(75, bsd_madvise); reg_bsd(197, bsd_mmap);
 	reg_bsd(199, bsd_lseek);   reg_bsd(153, bsd_pread);   reg_bsd(154, bsd_pwrite);

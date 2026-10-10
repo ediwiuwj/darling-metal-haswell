@@ -98,7 +98,7 @@ static int darwin_to_linux_sig_k(int d) {
 	}
 }
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
-struct knote { struct kev k; int kq, fd; int enabled, owns_fd; struct knote* next; };   // owns_fd: el fd es solo de este knote
+struct knote { struct kev k; int kq, fd; int enabled, owns_fd, deferdel, fake_fd; struct knote* next; };   // deferdel/fake_fd: borrado diferido de XNU (KN_DEFERDELETE)   // owns_fd: el fd es solo de este knote
 static struct knote* notes;
 // Los hilos de las colas de trabajo llaman a kevent a la vez: sin este cerrojo, un hilo liberaba un knote (drop) mientras otro
 // acababa de recibirlo de epoll_wait y lo leía ya liberado (udata = 0 -> SIGSEGV en _dispatch_kevent_merge, que mataba a launchd
@@ -139,6 +139,7 @@ static void sync_fd(int kq, int fd) {
 static void drop(struct knote* dead) {
 	for (struct knote** p = &notes; *p; p = &(*p)->next)
 		if (*p == dead) { *p = dead->next; break; }
+	if (dead->fake_fd > 0) { epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fake_fd, NULL); close(dead->fake_fd); }
 	if (dead->fd >= 0) {
 		if (dead->owns_fd) {
 			epoll_ctl(dead->kq, EPOLL_CTL_DEL, dead->fd, NULL);
@@ -239,7 +240,13 @@ static int wl_sync_change(int kq, struct kev* c) {
 static int apply(int kq, const struct kev* c) {
 	if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
 	struct knote* n = find(kq, c->ident, c->filter, c->flags, c->udata);
-	if (c->flags & EV_DELETE) { if (!n) return D_ENOENT; drop(n); return 0; }
+	if (c->flags & EV_DELETE) {
+		if (!n) return D_ENOENT;
+		// XNU: borrar sin EV_ENABLE un knote EV_DISPATCH2 desactivado queda diferido (EINPROGRESS) hasta que se reactive.
+		if (!(c->flags & EV_ENABLE) && (n->k.flags & 0x180) == 0x180 && !n->enabled) { n->deferdel = 1; return 36 /* EINPROGRESS */; }
+		drop(n);
+		return 0;
+	}
 	if (!n) {
 		if (!(c->flags & EV_ADD)) return D_ENOENT;
 		n = calloc(1, sizeof *n);
@@ -306,6 +313,14 @@ static int apply(int kq, const struct kev* c) {
 		}
 		if (c->flags & EV_DISABLE) n->enabled = 0;
 		sync_fd(kq, n->fd);
+	} else if (n->deferdel) {
+		// Ya entregó su último evento: al reactivarlo, el núcleo responde con un evento falso EV_DELETE|EV_ONESHOT y lo suelta.
+		if ((c->flags & EV_ENABLE) && n->fake_fd <= 0) {
+			n->fake_fd = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
+			struct epoll_event e = { .events = EPOLLIN, .data.u64 = (uint64_t)(uint32_t)n->fake_fd };
+			if (n->fake_fd > 0) epoll_ctl(kq, EPOLL_CTL_ADD, n->fake_fd, &e);
+		}
+		return 0;
 	} else {
 		if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: actualiza MACHPORT 0x%lx flags=0x%x fflags=0x%x (activo antes=%d)\n", c->ident, c->flags, c->fflags, n->enabled);
 		// EV_ADD sobre un knote existente: como f_touch de XNU, los parámetros nuevos sustituyen a los anteriores (libdispatch
@@ -400,10 +415,19 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		struct knote* next;
 		for (struct knote* n = notes; n && nout < nev; n = next) {
 			next = n->next;
+			if (n->kq == kq && n->fake_fd > 0 && n->fake_fd == fd) {      // fin de vida de un knote en borrado diferido
+				struct kev k = n->k;
+				k.flags = 0x180 | EV_ONESHOT | EV_DELETE; k.fflags = 0; k.data = 0;
+				kev_out(layout, raw, &k);
+				if (safe_write(evp + nout * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) { pthread_mutex_unlock(&kq_lock); return -D_EFAULT; }
+				nout++;
+				drop(n);
+				continue;
+			}
 			if (n->kq != kq || n->fd != fd || !n->enabled) continue;
 			if (n->k.filter == EVFILT_READ && !(evs & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) continue;
 			if (n->k.filter == EVFILT_WRITE && !(evs & (EPOLLOUT | EPOLLHUP | EPOLLERR))) continue;
-			if ((trace_all || mach_trace()) && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (dout=%d)\n", n->k.ident, g_dout != 0);
+			if ((trace_all || mach_trace()) && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (dout=%d) udata=0x%lx kq=%d flags=0x%x\n", n->k.ident, g_dout != 0, n->k.udata, kq, n->k.flags);
 			struct kev k = n->k;
 			k.flags &= (uint16_t)~(EV_ADD | EV_ENABLE | EV_DISABLE | EV_DELETE | EV_RECEIPT | 0x200 /*EV_VANISHED*/);   // el kernel no repite las banderas de registro
 			k.data = 1;
@@ -425,15 +449,21 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 						if (port_drain_idle((uint32_t)n->k.ident)) { int old = n->fd; n->fd = -1; sync_fd(n->kq, old); }
 						continue;
 					}
-					if (rr) { if (trace_all || mach_trace() || (rr & 0xffffc000) != 0x10004000) logf_("    kevent: recepción directa en 0x%lx devolvió 0x%lx\n", n->k.ident, rr); k.fflags = (uint32_t)rr; }
+					if (rr) {
+						if (trace_all || mach_trace() || (rr & 0xffffc000) != 0x10004000) logf_("    kevent: recepción directa en 0x%lx devolvió 0x%lx\n", n->k.ident, rr);
+						k.fflags = (uint32_t)rr; k.ext[0] = 0; k.ext[2] = 0; k.ext[3] = 0;
+						if (rr == MACH_RCV_TOO_LARGE__) { k.ext[1] = total; k.data = (int64_t)n->k.ident; }   // tamaño necesario e identidad del puerto
+						else k.ext[1] = 0;
+					}
 					else {
 						k.fflags = 0;                                  // resultado de mach_msg: éxito (no las banderas pedidas)
-						k.ext[0] = g_dout; k.ext[1] = total;
+						// ext[0] = mensaje, ext[1] = tamaño con trailer, ext[2] = prioridad del mensaje (<< 32), ext[3] = tamaño auxiliar
+						k.ext[0] = g_dout; k.ext[1] = total; k.ext[2] = 0; k.ext[3] = 0;
 						g_dout += (total + 15) & ~15u; avail -= (total + 15) & ~15u;
 						safe_write(g_davail, &avail, 8);
 					}
 				}
-				else k.fflags = 0;                                  // sin recepción directa no hay resultado de mach_msg que informar
+				else { k.fflags = 0; k.ext[0] = k.ext[1] = k.ext[2] = k.ext[3] = 0; }   // sin recepción directa: solo "hay mensaje"
 			}
 			else if (n->k.filter == EVFILT_PROC) {
 				siginfo_t si = { 0 };
@@ -460,10 +490,13 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 			kev_out(layout, raw, &k);
 			if (safe_write(evp + nout * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) { pthread_mutex_unlock(&kq_lock); return -D_EFAULT; }
 			nout++;
-			// EV_ONESHOT: sin EV_UDATA_SPECIFIC el knote desaparece al entregarse; con él, libdispatch lo borrará después con
-			// EV_DELETE (lo marca "needs delete"), así que se queda desactivado hasta entonces.
-			if ((n->k.flags & EV_ONESHOT) && !(n->k.flags & 0x100)) drop(n);
-			else if (n->k.flags & (EV_ONESHOT | 0x80 /*EV_DISPATCH*/)) knote_set_enabled(n, 0);   // EV_DISPATCH: se desactiva tras entregar
+			// EV_ONESHOT: el knote desaparece al entregarse, salvo con EV_DISPATCH2 (DISPATCH|UDATA_SPECIFIC): XNU lo deja en borrado
+			// diferido (desactivado) hasta que libdispatch lo borre con EV_DELETE.
+			if (n->k.flags & EV_ONESHOT) {
+				if ((n->k.flags & 0x180) == 0x180 && !n->deferdel) { n->deferdel = 1; knote_set_enabled(n, 0); }   // EV_DISPATCH2: borrado diferido
+				else drop(n);
+			}
+			else if (n->k.flags & 0x80 /*EV_DISPATCH*/) knote_set_enabled(n, 0);   // EV_DISPATCH: se desactiva tras entregar
 		}
 	}
 	pthread_mutex_unlock(&kq_lock);

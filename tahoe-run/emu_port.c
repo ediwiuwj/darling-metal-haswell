@@ -47,6 +47,7 @@ static int local_sock[MAXPORTS];           // socket de despertar de los puertos
 
 static int is_creator;
 void start_syslog_listener(void);
+void populate_data_volume(void);
 void ports_cleanup(void);
 void ports_cleanup(void) {                       // solo el proceso que creó la región la borra (y los shm_open del arranque)
 	if (!is_creator) return;
@@ -70,6 +71,7 @@ static void shm_init(void) {
 	if (shm == MAP_FAILED) { logf_("    puertos: mmap: %s\n", strerror(errno)); exit(70); }
 	if (creator) {
 		is_creator = 1;
+		populate_data_volume();                       // plantilla del volumen de datos (dslocal, /private/var/...)
 		start_syslog_listener();
 		pthread_mutexattr_t ma; pthread_mutexattr_init(&ma); pthread_mutexattr_setpshared(&ma, PTHREAD_PROCESS_SHARED); pthread_mutexattr_setrobust(&ma, PTHREAD_MUTEX_ROBUST);
 		pthread_mutex_init(&shm->lk, &ma);

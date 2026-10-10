@@ -250,14 +250,16 @@ int diag_target(void) {
 	}
 	return want;
 }
-// Lee los mensajes de aborto de todas las imágenes de la caché compartida (mapeada en 0x7ff800000000, sin slide).
+// Lee los mensajes de aborto del ejecutable principal (cargado en 0x100000000) y de todas las imágenes de la caché
+// compartida (mapeada en 0x7ff800000000, sin slide).
 static void crash_messages(void) {
 	const uint64_t cache = 0x7ff800000000UL;
 	uint32_t io = 0, ic = 0;
-	if (safe_read(cache + 0x1c0, &io, 4) != 4 || safe_read(cache + 0x1c4, &ic, 4) != 4 || !ic || ic > 10000) return;
-	for (uint32_t i = 0; i < ic; i++) {
+	if (safe_read(cache + 0x1c0, &io, 4) != 4 || safe_read(cache + 0x1c4, &ic, 4) != 4 || !ic || ic > 10000) ic = 0;
+	for (uint32_t i = 0; i <= ic; i++) {
 		uint64_t mh = 0; uint32_t pathoff = 0;
-		if (safe_read(cache + io + i * 32ULL, &mh, 8) != 8 || safe_read(cache + io + i * 32ULL + 24, &pathoff, 4) != 4) continue;
+		if (i == ic) mh = 0x100000000UL;                            // el propio ejecutable
+		else if (safe_read(cache + io + i * 32ULL, &mh, 8) != 8 || safe_read(cache + io + i * 32ULL + 24, &pathoff, 4) != 4) continue;
 		uint32_t hdr[8];
 		if (safe_read(mh, hdr, 32) != 32 || hdr[0] != 0xfeedfacf) continue;
 		uint64_t lc = mh + 32;
@@ -276,7 +278,7 @@ static void crash_messages(void) {
 					if (m1) safe_string(m1, t1, sizeof t1);
 					if (m2) safe_string(m2, t2, sizeof t2);
 					if (t1[0] || t2[0]) {
-						safe_string(cache + pathoff, path, sizeof path);
+						if (pathoff) safe_string(cache + pathoff, path, sizeof path); else snprintf(path, sizeof path, "ejecutable");
 						const char* b = strrchr(path, '/');
 						logf_("    abort <%d>: [%s] \"%s\"%s%s\n", (int)getpid(), b ? b + 1 : path, t1, t2[0] ? " / " : "", t2);
 					}

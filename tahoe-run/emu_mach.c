@@ -310,6 +310,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		struct hdr hh; memcpy(&hh, m, sizeof hh);
 		safe_write(buf, m, sizeof hh < size ? sizeof hh : size);
 		if (trace_all) logf_("    mach_msg: 0x%x demasiado grande (%u bytes, cabía %u): RCV_LARGE\n", rcv_name, size, cap);
+		if (total) *total = size + tsize;                      // tamaño necesario (con trailer), para kevent ext[1]
 		free(m);
 		return r;
 	}
@@ -345,6 +346,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		safe_write(buf, m, cap < size ? cap : size);
 		(void)fit;
 		res = 0x10004004;
+		if (total) *total = size + tsize;
 	}
 	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
@@ -415,7 +417,10 @@ static long mach_msg2(struct ctx* c) {
 	if (!kobject && h.remote == 0) { if (trace_all) logf_("    mach_msg2: envío al puerto nulo (id=%d) -> MACH_SEND_INVALID_DEST\n", h.id); return 0x10000003; }   // el núcleo rechaza el destino nulo
 	if (!kobject && port_exists(h.remote)) {                    // envío a un puerto de usuario: se encola tal cual
 		memcpy(req, &h, sizeof h);
-		port_send(h.remote, req, ssize);
+		if (port_send(h.remote, req, ssize) != 0) {               // el mensaje no se pudo encolar: decirlo, no perderlo en silencio
+			logf_("    mach_msg2: <%d> envío a 0x%x (id=%d, %u bytes) no encolado\n", (int)getpid(), h.remote, h.id, ssize);
+			return port_exists(h.remote) ? 0x1000000d /* MACH_SEND_NO_BUFFER */ : MACH_SEND_INVALID_DEST_;
+		}
 		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
 		return (options & 2) ? vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size) : MACH_MSG_SUCCESS;
 	}
