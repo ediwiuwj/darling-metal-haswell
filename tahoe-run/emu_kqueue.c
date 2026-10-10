@@ -82,6 +82,11 @@ static int darwin_to_linux_sig_k(int d) {
 struct kev { uint64_t ident; int16_t filter; uint16_t flags; uint32_t fflags; int64_t data; uint64_t udata; uint64_t ext[4]; uint32_t qos; };
 struct knote { struct kev k; int kq, fd; int enabled; struct knote* next; };
 static struct knote* notes;
+// Los hilos de las colas de trabajo llaman a kevent a la vez: sin este cerrojo, un hilo liberaba un knote (drop) mientras otro
+// acababa de recibirlo de epoll_wait y lo leía ya liberado (udata = 0 -> SIGSEGV en _dispatch_kevent_merge, que mataba a launchd
+// según el reparto de tiempos). También protege la lista y la tabla de workloops.
+static pthread_mutex_t kq_lock = PTHREAD_MUTEX_INITIALIZER;
+static int knote_alive(const struct knote* n) { for (const struct knote* q = notes; q; q = q->next) if (q == n) return 1; return 0; }
 static int workq_kq = -1;
 
 static struct knote* find(int kq, uint64_t ident, int filter) {
@@ -248,7 +253,9 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		struct kev k;
 		if (safe_read(chg + i * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) return -D_EFAULT;
 		kev_in(layout, raw, &k);
+		pthread_mutex_lock(&kq_lock);
 		int e = apply(kq, &k);
+		pthread_mutex_unlock(&kq_lock);
 		if (e || (k.flags & EV_RECEIPT)) {
 			if (nout < nev) {
 				k.flags |= EV_ERROR; k.data = e;
@@ -264,8 +271,10 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 	if (nout) timeout_ms = 0;
 	int r = epoll_wait(kq, es, max, timeout_ms);
 	if (r < 0) return errno == EINTR ? -4 /* EINTR */ : -darwin_errno(errno);
+	pthread_mutex_lock(&kq_lock);
 	for (int i = 0; i < r; i++) {
 		struct knote* n = es[i].data.ptr;
+		if (!knote_alive(n)) continue;                                   // lo eliminó otro hilo tras epoll_wait
 		if (trace_all && n->k.filter == EVFILT_MACHPORT) logf_("    kevent: epoll avisa del puerto 0x%lx (activo=%d, dout=%d)\n", n->k.ident, n->enabled, g_dout != 0);
 		if (!n->enabled) continue;
 		struct kev k = n->k;
@@ -309,10 +318,11 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		}
 		else if (n->k.filter == EVFILT_TIMER || n->k.filter == EVFILT_USER) { uint64_t cnt = 0; if (read(n->fd, &cnt, 8) == 8) k.data = (int64_t)cnt; }
 		kev_out(layout, raw, &k);
-		if (safe_write(evp + nout * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) return -D_EFAULT;
+		if (safe_write(evp + nout * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) { pthread_mutex_unlock(&kq_lock); return -D_EFAULT; }
 		nout++;
 		if (n->k.flags & EV_ONESHOT) drop(n);
 	}
+	pthread_mutex_unlock(&kq_lock);
 	return nout;
 }
 
@@ -339,10 +349,15 @@ static long bsd_kevent_qos(struct ctx* c) {
 // libdispatch (workloop); cada identificador tiene su propio kqueue.
 static struct { uint64_t id; int kq; } workloops[64];
 int kq_workloop_fd(uint64_t id) {
+	static pthread_mutex_t wl_lock = PTHREAD_MUTEX_INITIALIZER;
+	int r = -1;
+	pthread_mutex_lock(&wl_lock);
 	for (int i = 0; i < 64; i++) {
-		if (workloops[i].kq > 0 && workloops[i].id == id) return workloops[i].kq;
-		if (workloops[i].kq == 0) { workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = id; return workloops[i].kq; }
+		if (workloops[i].kq > 0 && workloops[i].id == id) { r = workloops[i].kq; break; }
+		if (workloops[i].kq == 0) { workloops[i].kq = epoll_create1(EPOLL_CLOEXEC); workloops[i].id = id; r = workloops[i].kq; break; }
 	}
+	pthread_mutex_unlock(&wl_lock);
+	if (r >= 0) return r;
 	return -1;
 }
 // Recoge sin esperar los eventos pendientes de un workloop (kevent_qos_s de 72 bytes). Devuelve cuántos.
