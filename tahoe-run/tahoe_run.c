@@ -533,6 +533,18 @@ done:
 	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? -darwin_errno(errno) : fd;
 }
+static long bsd_proc_info(struct ctx* c);
+// proc_info_extended_id(callnum, pid, flags, ext_id_type, ext_id, flavor, arg, buffer, buffersize): proc_info con una
+// comprobación de identidad extra (uniqueid/versión) que aquí no hace falta.
+static long bsd_proc_info_ext(struct ctx* c) {
+	struct ctx c2 = *c;
+	c2.a[0] = c->a[0]; c2.a[1] = c->a[1];
+	c2.a[2] = c->a[5];                                   // flavor
+	c2.a[3] = ctx_arg(c, 6);                             // arg
+	c2.a[4] = ctx_arg(c, 7);                             // buffer
+	c2.a[5] = ctx_arg(c, 8);                             // buffersize
+	return bsd_proc_info(&c2);
+}
 // open_dprotected_np(ruta, oflags, clase, dpflags, mode): como open; la clase de protección de datos no existe aquí.
 static long bsd_open_dprotected(struct ctx* c) {
 	struct ctx c2 = *c;
@@ -638,7 +650,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
-	[5] = bsd_open, [216] = bsd_open_dprotected, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
 };
 
 

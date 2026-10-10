@@ -112,6 +112,26 @@ static long cs_ops(int pid, int op, uint64_t uaddr, uint64_t usize) {
 		free(b);
 		return r;
 	}
+	case 11: case 14: {                                          // IDENTITY / TEAMID: cadenas del CodeDirectory (ranura 0)
+		uint32_t len = 0;
+		uint8_t* cd = cs_blob(pid, 0, &len);
+		const char* s = NULL;
+		if (cd && len >= 52 && be32(cd) == 0xfade0c02) {
+			uint32_t off = op == 11 ? be32(cd + 20) : (be32(cd + 8) >= 0x20200 ? be32(cd + 48) : 0);
+			if (off && off < len && memchr(cd + off, 0, len - off)) s = (const char*)cd + off;
+		}
+		long r;
+		if (!s) r = op == 14 ? -D_ENOENT : copy_token(NULL, 0, uaddr, usize);
+		else {                                                   // cabecera falsa {0, longitud total} y la cadena detrás
+			uint32_t sl = (uint32_t)strlen(s) + 1, tot = sl + 8;
+			uint8_t* b = malloc(tot);
+			memset(b, 0, 8); uint32_t bl = htonl(tot); memcpy(b + 4, &bl, 4); memcpy(b + 8, s, sl);
+			r = copy_token(b, tot, uaddr, usize);
+			free(b);
+		}
+		free(cd);
+		return r;
+	}
 	default:
 		logf_("    csops: operación %d sin implementar\n", op);
 		return -D_EINVAL;

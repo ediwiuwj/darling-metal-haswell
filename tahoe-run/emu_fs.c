@@ -14,6 +14,7 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
+#include <linux/falloc.h>
 #include "tahoe.h"
 
 static long err(void) { return -darwin_errno(errno); }
@@ -167,6 +168,45 @@ static long bsd_fcntl(struct ctx* c) {
 		if (trace_all) logf_("    F_GETPATH(fd=%d) = \"%s\"\n", fd, p);
 		return safe_write(c->a[2], p, strlen(p) + 1) > 0 ? 0 : -D_EFAULT;
 	}
+	case 102: { struct ctx c2 = *c; c2.a[1] = 50; return bsd_fcntl(&c2); }   // F_GETPATH_NOFIRMLINK: sin firmlinks aquí
+	case 7: case 8: case 9: case 90: case 91: case 92: case 93: {   // F_GETLK/SETLK/SETLKW y sus versiones OFD (por descripción abierta)
+		// struct flock de Darwin: l_start, l_len (off_t), l_pid, l_type, l_whence (short). La de Linux tiene otro orden.
+		uint8_t df[24];
+		if (safe_read(c->a[2], df, 24) != 24) return -D_EFAULT;
+		struct flock lf = { 0 };
+		int16_t dt, dw; memcpy(&lf.l_start, df, 8); memcpy(&lf.l_len, df + 8, 8); memcpy(&dt, df + 20, 2); memcpy(&dw, df + 22, 2);
+		lf.l_type = dt == 1 ? F_RDLCK : dt == 3 ? F_WRLCK : F_UNLCK;   // Darwin: F_RDLCK 1, F_UNLCK 2, F_WRLCK 3
+		lf.l_whence = dw;
+		int lc = cmd == 7 ? F_GETLK : cmd == 8 ? F_SETLK : cmd == 9 ? F_SETLKW : cmd == 92 ? F_OFD_GETLK : cmd == 90 ? F_OFD_SETLK : F_OFD_SETLKW;
+		if (fcntl(fd, lc, &lf) != 0) return err();
+		if (cmd == 7 || cmd == 92) {                       // devolver el cerrojo que estorba (o F_UNLCK)
+			int16_t ot = lf.l_type == F_RDLCK ? 1 : lf.l_type == F_WRLCK ? 3 : 2, ow = (int16_t)lf.l_whence;
+			int32_t opid = lf.l_pid;
+			memcpy(df, &lf.l_start, 8); memcpy(df + 8, &lf.l_len, 8); memcpy(df + 16, &opid, 4); memcpy(df + 20, &ot, 2); memcpy(df + 22, &ow, 2);
+			if (safe_write(c->a[2], df, 24) != 24) return -D_EFAULT;
+		}
+		return 0;
+	}
+	case 61: case 83: case 103: case 104: case 113: return 0;   // F_ADDFILESIGS*: no hay validación de firmas que hacer
+	case 97: {                                              // F_ADDFILESIGS_RETURN: la firma "cubre" todo el archivo
+		struct stat st;
+		if (fstat(fd, &st) != 0) return err();
+		int64_t end = st.st_size;
+		return safe_write(c->a[2], &end, 8) == 8 ? 0 : -D_EFAULT;   // fs_file_start de salida: fin cubierto
+	}
+	case 98: case 62: case 76: case 100: case 101: return 0;   // CHECK_LV, NODIRECT, SINGLE_WRITER, TRIM_ACTIVE_FILE, SPECULATIVE_READ
+	case 73: return 0;                                      // F_SETNOSIGPIPE: el emulador ya evita SIGPIPE en los envíos
+	case 74: case 63: case 77: return 0;                    // F_GETNOSIGPIPE, F_GETPROTECTIONCLASS, F_GETPROTECTIONLEVEL: 0
+	case 64: return 0;                                      // F_SETPROTECTIONCLASS: sin clases de protección
+	case 85: RET(fdatasync(fd));                            // F_BARRIERFSYNC
+	case 99: {                                              // F_PUNCHHOLE(fpunchhole_t: flags, reservado, offset, length)
+		uint64_t ph[3]; uint8_t raw[24];
+		if (safe_read(c->a[2], raw, 24) != 24) return -D_EFAULT;
+		memcpy(&ph[1], raw + 8, 8); memcpy(&ph[2], raw + 16, 8);
+		RET(fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)ph[1], (off_t)ph[2]));
+	}
+	case 106: RET(fcntl(fd, F_SETLEASE, (int)c->a[2] == 1 ? F_RDLCK : (int)c->a[2] == 3 ? F_WRLCK : F_UNLCK));
+	case 107: { int l = fcntl(fd, F_GETLEASE); if (l < 0) return err(); return l == F_RDLCK ? 1 : l == F_WRLCK ? 3 : 2; }
 	default:
 		logf_("    fcntl: comando %d (fd=%d) sin implementar\n", cmd, fd);
 		return -D_EINVAL;
