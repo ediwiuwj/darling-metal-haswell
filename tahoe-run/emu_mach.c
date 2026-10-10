@@ -421,7 +421,29 @@ static long mach_msg2(struct ctx* c) {
 	}
 	size_t n;
 	switch (h.id) {
-	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // host_request_notification / thread_policy(_set): sin efecto
+	case 217: case 3616: case 3617: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 5403: n = reply_begin(rep, &h, 46 /* KERN_NOT_SUPPORTED */); break;   // mach_voucher_attr_command: sin vales de atributos
+	case 3612: {                                                  // thread_info(hilo, flavor, cuenta) -> info[cuenta]
+		uint32_t flavor, cnt; memcpy(&flavor, req + 32, 4); memcpy(&cnt, req + 36, 4);
+		uint32_t info[32] = { 0 }; uint32_t outc = 0;
+		extern __thread uint32_t g_thread_port;
+		extern uint64_t dispatch_queue_offset;
+		int self = h.remote == g_thread_port;
+		if (flavor == 3) {                                        // THREAD_BASIC_INFO: tiempos 0, ejecutándose (run_state 1)
+			info[6] = 1; outc = 10;
+		} else if (flavor == 4) {                                 // THREAD_IDENTIFIER_INFO: thread_id, thread_handle (TSD), dispatch_qaddr
+			uint64_t tid = self ? (uint64_t)syscall(SYS_gettid) : h.remote, gs = 0;
+			if (self) syscall(SYS_arch_prctl, 0x1004 /*ARCH_GET_GS*/, &gs);
+			uint64_t dq = (self && gs && dispatch_queue_offset) ? gs + dispatch_queue_offset : 0;
+			memcpy(info, &tid, 8); memcpy(info + 2, &gs, 8); memcpy(info + 4, &dq, 8); outc = 6;
+		} else outc = 0;
+		if (cnt < outc) outc = cnt;
+		if (!outc && flavor != 3 && flavor != 4) { n = reply_begin(rep, &h, 4 /* KERN_INVALID_ARGUMENT */); break; }
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		memcpy(rep + n, &outc, 4); n += 4;
+		memcpy(rep + n, info, outc * 4); n += outc * 4;
+		break;
+	}   // host_request_notification / thread_policy(_set): sin efecto
 	case 3240: {                                                  // mach_port_is_connection_for_service(conexión, servicio) -> id de política de filtro
 		n = reply_begin(rep, &h, KERN_SUCCESS_);
 		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0

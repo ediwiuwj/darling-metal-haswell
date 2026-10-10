@@ -533,6 +533,8 @@ done:
 	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? -darwin_errno(errno) : fd;
 }
+// guarded_pwrite_np(fd, guard*, búfer, tamaño, desplazamiento): pwrite; la guarda no se comprueba.
+static long bsd_guarded_pwrite(struct ctx* c) { long r = pwrite((int)c->a[0], (const void*)c->a[2], c->a[3], (off_t)c->a[4]); return r < 0 ? -darwin_errno(errno) : r; }
 static long bsd_proc_info(struct ctx* c);
 // proc_info_extended_id(callnum, pid, flags, ext_id_type, ext_id, flavor, arg, buffer, buffersize): proc_info con una
 // comprobación de identidad extra (uniqueid/versión) que aquí no hace falta.
@@ -650,7 +652,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
-	[5] = bsd_open, [216] = bsd_open_dprotected, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [486] = bsd_guarded_pwrite, [545] = bsd_proc_info_ext, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
 };
 
 
@@ -723,11 +725,18 @@ static long mach_timebase_info_trap(struct ctx* c) {
 	uint32_t tb[2] = { 1, 1 };                         // el contador ya está en nanosegundos
 	return safe_write(c->a[0], tb, 8) == 8 ? KERN_SUCCESS_ : KERN_INVALID_ADDRESS_;
 }
+// _kernelrpc_mach_vm_purgable_control_trap(tarea, dirección, control, *estado): la memoria no es purgable aquí; el
+// estado es siempre VM_PURGABLE_NONVOLATILE (0), tanto al consultar como el anterior al cambiarlo.
+static long mach_vm_purgable_trap(struct ctx* c) {
+	int zero = 0;
+	if (c->a[3] && safe_write(c->a[3], &zero, 4) != 4) return 4;   // KERN_INVALID_ARGUMENT
+	return 0;
+}
 static mach_fn mach_table[MACH_NAMES_N] = {
 	[10] = mach_vm_allocate_trap, [12] = mach_vm_deallocate_trap, [15] = mach_vm_map_trap,
 	[18] = mach_nop_success, [88] = mach_not_supported, [19] = mach_nop_success, [21] = mach_nop_success, [24] = mach_nop_success, [25] = mach_nop_success,
 	[89] = mach_timebase_info_trap,
-	[14] = mach_vm_protect_trap,
+	[14] = mach_vm_protect_trap, [11] = mach_vm_purgable_trap,
 	[26] = mach_reply_port_trap, [27] = mach_thread_self_trap, [28] = mach_task_self_trap, [29] = mach_host_self_trap,
 };
 

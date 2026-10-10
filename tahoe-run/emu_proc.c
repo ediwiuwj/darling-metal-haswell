@@ -15,7 +15,8 @@
 // bsdthread_register(thread_start, wqthread, pthread_size, ...): libpthread registra aquí las funciones con las
 // que el kernel arranca hilos nuevos. Se guardan y se devuelve la máscara de capacidades.
 uint64_t thread_start_fn, wqthread_fn, pthread_size;
-static uint32_t tsd_offset, mach_thread_self_offset;   // desplazamiento del TSD dentro de pthread_t (struct _pthread_registration_data, +24)
+static uint32_t tsd_offset, mach_thread_self_offset;
+uint64_t dispatch_queue_offset;   // desplazamiento del TSD dentro de pthread_t (struct _pthread_registration_data, +24)
 // work_interval_ctl(operación, id, arg, longitud): intervalos de trabajo del planificador (audio/gráficos en tiempo real).
 // No hay planificador que informar: se crean intervalos con un puerto propio y el resto de operaciones se aceptan.
 static long bsd_work_interval_ctl(struct ctx* c) {
@@ -38,6 +39,7 @@ static long bsd_bsdthread_register(struct ctx* c) {
 	pthread_size = c->a[2];
 	if (c->a[3]) {
 		safe_read(c->a[3] + 24, &tsd_offset, 4); safe_read(c->a[3] + 32, &mach_thread_self_offset, 4);
+		dispatch_queue_offset = c->a[5];             // TSD de la cola de dispatch actual (thread_info IDENTIFIER: dispatch_qaddr)
 		// mutex_default_policy (+44): mutex y variables de condición basados en ulock (futex) en vez de psynch, que no se emula.
 		// 0x100 = _PTHREAD_REG_DEFAULT_USE_ULOCK; los 8 bits bajos son la política (3 = primer ajuste).
 		uint32_t pol = 0x100 | 3;
