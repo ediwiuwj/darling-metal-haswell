@@ -350,3 +350,11 @@ los avisos son un nivel (se vacían y se renuevan mientras quede cola: la cola d
 variables de condición por puerto (antes una global despertaba a todos); y `SIDT`: libdispatch lee de ahí el "número de CPU" (en macOS
 va en el límite de la IDT; en Linux siempre vale 0xfff), así que se reserva el segmento 0xfff de su montón de 32 MiB.
 `launchctl print system` también funciona: `mach_make_memory_entry` se respalda con un archivo en `/dev/shm` que sustituye el rango del creador por una proyección compartida (`mach_vm_map` con objeto la mapea en el receptor).
+
+### IOKit
+`tahoe-run/emu_iokit.inc` implementa el servidor MIG de `device.defs` (ids 2800-2890) con un registro de E/S completo: árbol de
+entradas (plataforma, ACPI, PCI con la GPU real leída de `/sys`, HID, batería, SMC, medios...), planos `IOService` e `IODeviceTree`,
+rutas, iteradores (recursivos, hacia los padres, entrar/salir), propiedades en binario de OSSerialize y en XML, diccionarios de
+coincidencia (XML/binario/OOL: `IOProviderClass` con herencia, `IONameMatch`, `IOPropertyMatch`, `IOResourceMatch`, `IOPathMatch`),
+notificaciones (mensaje id 53), conexiones con ganchos por clase (AppleSMC responde "clave no encontrada"; el resto de métodos
+devuelve `kIOReturnUnsupported` hasta que el puente DRM/Metal registre ganchos). El `ioreg` real de macOS 26 lo recorre entero.

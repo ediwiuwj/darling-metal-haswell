@@ -53,55 +53,7 @@ static size_t reply_begin(uint8_t* r, const struct hdr* req, int32_t retcode) {
 static void reply_end(uint8_t* r, size_t len) { memcpy(r + 4, &(uint32_t){ (uint32_t)len }, 4); }
 
 
-// ---------------------------------------------------------------- IOKit: registro mínimo
-// Cada entrada del registro se representa con un puerto (el "io_object_t" del cliente). Ids según device.defs de xnu.
-static size_t reply_port(uint8_t* r, const struct hdr* req, uint32_t name, uint8_t disposition);
-struct ioent { uint32_t port; const char* name; const char* cls; uint64_t id; };
-static struct ioent io_ents[] = {
-	{ 0, "Root", "IORegistryEntry", 0x100000100ULL },
-	{ 0, "IOPMrootDomain", "IOPMrootDomain", 0x100000200ULL },
-	{ 0, "/", "IOPlatformExpertDevice", 0x100000300ULL },
-	{ 0, "options", "IODTNVRAM", 0x100000400ULL },
-};
-static struct ioent* io_by_port(uint32_t p) { for (unsigned i = 0; i < sizeof io_ents / sizeof *io_ents; i++) if (io_ents[i].port == p) return &io_ents[i]; return NULL; }
-static struct ioent* io_handle(struct ioent* e) { if (!e->port) e->port = alloc_port(); return e; }
-// cadena MIG c_string[*:N] en respuesta: offset(0) + cuenta (con NUL) + bytes rellenados a 4
-static size_t io_put_string(uint8_t* r, size_t off, const char* s) {
-	uint32_t cnt = (uint32_t)strlen(s) + 1, z = 0;
-	memcpy(r + off, &z, 4); memcpy(r + off + 4, &cnt, 4);
-	memset(r + off + 8, 0, (cnt + 3) & ~3u); memcpy(r + off + 8, s, cnt);
-	return off + 8 + ((cnt + 3) & ~3u);
-}
-static const char* io_req_string(const uint8_t* req, size_t off) { return (const char*)req + off + 8; }
-static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
-	*handled = 1;
-	switch (h->id) {
-	case 2877: { size_t n = reply_begin(rep, h, KERN_SUCCESS_); uint64_t v = 0x1; memcpy(rep + n, &v, 8); return n + 8; }   // io_server_version
-	case 2809: {                                                        // io_registry_entry_from_path
-		const char* path = io_req_string(req, 32);
-		struct ioent* e = NULL;
-		if (!strcmp(path, "IODeviceTree:/") || !strcmp(path, "IOService:/")) e = &io_ents[2];
-		else if (!strcmp(path, "IODeviceTree:/options")) e = &io_ents[3];
-		else if (strstr(path, "IOPMrootDomain")) e = &io_ents[1];
-		if (!e) return reply_begin(rep, h, (int32_t)0xe00002f0);
-		return reply_port(rep, h, io_handle(e)->port, 17);
-	}
-	case 2833: return reply_port(rep, h, io_handle(&io_ents[0])->port, 17);   // io_registry_get_root_entry
-	case 2800: case 2810: case 2843: {                                  // get_class / get_name / get_name_in_plane
-		struct ioent* e = io_by_port(h->remote);
-		if (!e) return reply_begin(rep, h, (int32_t)0xe00002c2);       // kIOReturnBadArgument
-		size_t n = reply_begin(rep, h, KERN_SUCCESS_);
-		return io_put_string(rep, n, h->id == 2800 ? e->cls : e->name);
-	}
-	case 2871: {                                                        // io_registry_entry_get_registry_entry_id
-		struct ioent* e = io_by_port(h->remote);
-		if (!e) return reply_begin(rep, h, (int32_t)0xe00002c2);
-		size_t n = reply_begin(rep, h, KERN_SUCCESS_); memcpy(rep + n, &e->id, 8); return n + 8;
-	}
-	default: *handled = 0; return 0;
-	}
-}
-
+#include "emu_iokit.inc"
 
 // ---- entradas de memoria (mach_make_memory_entry): se respaldan con un archivo en /dev/shm, nombrado por el puerto.
 // El rango del creador se sustituye por una proyección compartida del archivo para que el receptor vea sus escrituras.
@@ -440,6 +392,19 @@ static long mach_msg2(struct ctx* c) {
 	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
+	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado
+		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+		memmove((void*)dst, (void*)src, size);
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		break;
+	}
+	case 4808: {                                                  // mach_vm_read_overwrite(task, addr, size, data) -> outsize
+		uint64_t src, size, dst; memcpy(&src, req + 32, 8); memcpy(&size, req + 40, 8); memcpy(&dst, req + 48, 8);
+		memmove((void*)dst, (void*)src, size);
+		n = reply_begin(rep, &h, KERN_SUCCESS_); memcpy(rep + n, &size, 8); n += 8;
+		break;
+	}
+	case 4803: case 4809: case 4810: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // inherit / msync / behavior_set: sin efecto
 	case 200:  n = mig_host_info(&h, req, rep); break;
 	case 206:  n = mig_host_get_clock_service(&h, req, rep); break;
 	case 222: n = reply_port(rep, &h, alloc_port(), 17); break;   // host_create_mach_voucher: puerto de voucher ficticio
