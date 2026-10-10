@@ -358,3 +358,12 @@ rutas, iteradores (recursivos, hacia los padres, entrar/salir), propiedades en b
 coincidencia (XML/binario/OOL: `IOProviderClass` con herencia, `IONameMatch`, `IOPropertyMatch`, `IOResourceMatch`, `IOPathMatch`),
 notificaciones (mensaje id 53), conexiones con ganchos por clase (AppleSMC responde "clave no encontrada"; el resto de métodos
 devuelve `kIOReturnUnsupported` hasta que el puente DRM/Metal registre ganchos). El `ioreg` real de macOS 26 lo recorre entero.
+
+### Abortos de libdispatch (arreglados)
+Los demonios que abortaban con "BUG IN LIBDISPATCH: mach_msg_receive" (≈12: powerd, remoted, timed, findmydeviced, configd...) enviaban sus
+peticiones XPC con `mach_msg2` en **modo vectorial** (`MACH64_MSG_VECTOR`): `data` apunta a un `mach_msg_vector_t[mensaje, auxiliar]` y el
+tamaño real va en el vector, no en el registro. El envío fallaba en silencio, libxpc destruía su puerto de respuesta y la recepción siguiente
+abortaba. Ahora se soporta (más cabecera auxiliar vacía al recibir). Además: `fchflags/chflags` guardan `st_flags` como xattr (libsystem
+comprueba `rootless_mkdir_protected`), un kevent de puerto sin recepción directa devuelve `fflags=0`, y varias syscalls menores
+(`lchown`, `getxattr`, `gethostuuid`, `auditon`). Quedan `amfid` (SIGSEGV en el arranque de dyld) y WindowServer, que sale con código 1 al
+no poder abrir el cliente de usuario de `IOHIDSystem`.

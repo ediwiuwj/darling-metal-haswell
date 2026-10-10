@@ -357,17 +357,35 @@ static long user_receive(struct ctx* c, uint64_t options, uint64_t buf, uint32_t
 	return mach_rx_message(rcv_name, timeout, options, buf, rcvsize, NULL);
 }
 
+// Con vectores, el núcleo escribe siempre una cabecera auxiliar vacía (mach_msg_aux_header_t: tamaño 8) tras recibir.
+static long vec_aux(long r, uint64_t aux_addr, uint32_t aux_size) {
+	if (r == 0 && aux_addr && aux_size >= 8) { uint32_t h[2] = { 8, 0 }; safe_write(aux_addr, h, 8); }
+	return r;
+}
+
 static long mach_msg2(struct ctx* c) {
 	uint64_t options = c->a[1];
 	uint64_t buf = c->a[0];
 	uint32_t ssize = (uint32_t)(c->a[2] >> 32);
 	uint32_t rcvsize = (uint32_t)ctx_arg(c, 6);
+	uint64_t rbuf = buf, aux_addr = 0; uint32_t aux_size = 0;
+	if (options & 0x100000000ULL) {                         // MACH64_MSG_VECTOR: `data` apunta a mach_msg_vector_t[mensaje, auxiliar]
+		uint32_t cnt = (uint32_t)(c->a[2] >> 32), rc = (uint32_t)ctx_arg(c, 6);
+		if (rc > cnt) cnt = rc;
+		if (cnt > 2) cnt = 2;
+		if (!cnt) cnt = 1;
+		uint64_t v[6] = { 0 };
+		if (safe_read(c->a[0], v, cnt * 24) != (ssize_t)(cnt * 24)) return 0x10000003;
+		buf = v[0]; rbuf = v[1] ? v[1] : v[0];
+		ssize = (uint32_t)v[2]; rcvsize = (uint32_t)(v[2] >> 32);
+		if (cnt == 2) { aux_addr = v[4] ? v[4] : v[3]; aux_size = (uint32_t)(v[5] >> 32); }
+	}
 
 	static __thread uint8_t reqbuf[512 * 1024];     // los mensajes entre procesos (listas de servicios...) pueden ser grandes
 	uint8_t* req = reqbuf;
 	uint8_t rep[1024];
 	uint32_t rcv_name = (uint32_t)(c->a[5] >> 32);
-	if (!(options & 1) && (options & 2)) return user_receive(c, options, buf, rcv_name, rcvsize);
+	if (!(options & 1) && (options & 2)) return vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size);
 	if (ssize < sizeof(struct hdr) || ssize > sizeof reqbuf || safe_read(buf, req, ssize) != (ssize_t)ssize) {
 		logf_("    mach_msg2: mensaje ilegible o fuera de tamaño (%u bytes)\n", ssize);
 		return 0x10000003;                                      // MACH_SEND_INVALID_DATA
@@ -377,7 +395,7 @@ static long mach_msg2(struct ctx* c) {
 	// La cabecera de verdad viaja en registros (bits/tamaño, destino/local, voucher/id). Con SEND_KOBJECT_CALL el
 	// búfer la repite; en mensajes a puertos normales el búfer puede no contenerla.
 	uint64_t bs = c->a[2], rl = c->a[3], vi = c->a[4];
-	h.bits = (uint32_t)bs; h.size = (uint32_t)(bs >> 32);
+	h.bits = (uint32_t)bs; h.size = ssize;
 	h.remote = (uint32_t)rl; h.local = (uint32_t)(rl >> 32);
 	h.voucher = (uint32_t)vi; h.id = (int32_t)(vi >> 32);
 	int kobject = (options & 0x200000000ULL) != 0;
@@ -385,7 +403,7 @@ static long mach_msg2(struct ctx* c) {
 		memcpy(req, &h, sizeof h);
 		port_send(h.remote, req, ssize);
 		if (trace_all) logf_("    mach_msg2: envía a 0x%x (respuesta 0x%x) id=%d (%u bytes) bits=0x%x opciones=0x%lx\n", h.remote, h.local, h.id, ssize, h.bits, options);
-		return (options & 2) ? user_receive(c, options, buf, rcv_name, rcvsize) : MACH_MSG_SUCCESS;
+		return (options & 2) ? vec_aux(user_receive(c, options, rbuf, rcv_name, rcvsize), aux_addr, aux_size) : MACH_MSG_SUCCESS;
 	}
 	size_t n;
 	switch (h.id) {
@@ -460,7 +478,7 @@ static long mach_msg2(struct ctx* c) {
 		logf_("    mach_msg2: la respuesta (%zu+8) no cabe en rcv_size=%u (id=%d destino=0x%x)\n", n, rcvsize, h.id, h.remote);
 		return MACH_RCV_TOO_LARGE;
 	}
-	if (safe_write(buf, rep, n + 8) != (ssize_t)(n + 8)) return 0x10004003;   // MACH_RCV_INVALID_DATA
+	if (safe_write(rbuf, rep, n + 8) != (ssize_t)(n + 8)) return 0x10004003;   // MACH_RCV_INVALID_DATA
 	return MACH_MSG_SUCCESS;
 }
 

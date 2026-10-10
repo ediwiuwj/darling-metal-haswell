@@ -279,7 +279,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 				safe_read(g_davail, &avail, 8);
 				uint32_t total = 0;
 				long rr = avail ? mach_rx_message((uint32_t)n->k.ident, 0, n->k.fflags, g_dout, (uint32_t)avail, &total) : 0x10004004;
-				if (rr) { if (rr == 0x10004003) continue; k.fflags = (uint32_t)rr; }
+				if (rr) { if (trace_all || (rr & 0xffffc000) != 0x10004000) logf_("    kevent: recepción directa en 0x%lx devolvió 0x%lx\n", n->k.ident, rr); if (rr == 0x10004003) continue; k.fflags = (uint32_t)rr; }
 				else {
 					k.fflags = 0;                                  // resultado de mach_msg: éxito (no las banderas pedidas)
 					k.ext[0] = g_dout; k.ext[1] = total;
@@ -287,6 +287,7 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 					safe_write(g_davail, &avail, 8);
 				}
 			}
+			else k.fflags = 0;                                  // sin recepción directa no hay resultado de mach_msg que informar
 			if (n->k.flags & 0x80 /*EV_DISPATCH*/) knote_set_enabled(n, 0);
 		}
 		else if (n->k.filter == EVFILT_PROC) {

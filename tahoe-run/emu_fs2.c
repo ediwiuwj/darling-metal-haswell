@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/file.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -35,6 +36,21 @@ static long bsd_chmod(struct ctx* c)  { PATH1(p, 0); RET(chmod(p, (mode_t)c->a[1
 // daría EINVAL/EPERM. launchd lo hace con sus sockets y servicios; se acepta sin efecto.
 static long chown_result(long r) { if (r < 0 && (errno == EINVAL || errno == EPERM)) return 0; return r < 0 ? err() : 0; }
 static long bsd_chown(struct ctx* c)  { PATH1(p, 0); return chown_result(chown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
+static long bsd_ret0(struct ctx* c) { (void)c; return 0; }
+#include <sys/xattr.h>
+static long bsd_fchflags(struct ctx* c) { uint32_t v = (uint32_t)c->a[1]; fsetxattr((int)c->a[0], "user.tahoe.flags", &v, 4, 0); return 0; }   // sin soporte de xattr: se acepta igual
+static long bsd_chflags(struct ctx* c) { PATH1(p, 0); uint32_t v = (uint32_t)c->a[1]; lsetxattr(p, "user.tahoe.flags", &v, 4, 0); return 0; }
+static long bsd_no_xattr(struct ctx* c) { (void)c; return -93; }      // ENOATTR: sin atributos extendidos
+// gethostuuid(uuid_t, timeout): identificador estable de la máquina a partir de /etc/machine-id
+static long bsd_gethostuuid(struct ctx* c) {
+	uint8_t u[16] = { 0 };
+	FILE* f = fopen("/etc/machine-id", "r");
+	char id[40] = "";
+	if (f) { if (!fgets(id, sizeof id, f)) id[0] = 0; fclose(f); }
+	for (int i = 0; i < 16; i++) { char h[3] = { id[i * 2], id[i * 2 + 1], 0 }; u[i] = (uint8_t)strtoul(h, NULL, 16); }
+	u[6] = (u[6] & 0x0f) | 0x40; u[8] = (u[8] & 0x3f) | 0x80;
+	return safe_write(c->a[0], u, 16) == 16 ? 0 : -D_EFAULT;
+}
 static long bsd_lchown(struct ctx* c) { PATH1(p, 0); return chown_result(lchown(p, (uid_t)c->a[1], (gid_t)c->a[2])); }
 static long bsd_truncate(struct ctx* c) { PATH1(p, 0); RET(truncate(p, (off_t)c->a[1])); }
 static long bsd_mkfifo(struct ctx* c) { PATH1(p, 0); RET(mkfifo(p, (mode_t)c->a[1])); }
@@ -147,6 +163,8 @@ void emu_fs2_init(void) {
 	reg_bsd(465, bsd_renameat); reg_bsd(488, bsd_renameatx); reg_bsd(472, bsd_unlinkat); reg_bsd(475, bsd_mkdirat);
 	reg_bsd(474, bsd_symlinkat); reg_bsd(467, bsd_fchmodat); reg_bsd(468, bsd_fchownat); reg_bsd(471, bsd_linkat);
 	reg_bsd(136, bsd_mkdir); reg_bsd(137, bsd_rmdir); reg_bsd(10, bsd_unlink); reg_bsd(15, bsd_chmod);
+	reg_bsd(364, bsd_lchown); reg_bsd(34, bsd_chflags); reg_bsd(35, bsd_fchflags); reg_bsd(351, bsd_ret0);   // lchown; chflags/fchflags/auditon sin efecto
+	reg_bsd(234, bsd_no_xattr); reg_bsd(142, bsd_gethostuuid);
 	reg_bsd(16, bsd_chown); reg_bsd(254, bsd_lchown); reg_bsd(200, bsd_truncate); reg_bsd(132, bsd_mkfifo);
 	reg_bsd(128, bsd_rename); reg_bsd(9, bsd_link); reg_bsd(57, bsd_symlink);
 	reg_bsd(124, bsd_fchmod); reg_bsd(123, bsd_fchown); reg_bsd(201, bsd_ftruncate); reg_bsd(95, bsd_fsync);

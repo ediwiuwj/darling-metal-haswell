@@ -382,7 +382,10 @@ static long t_construct(struct ctx* c) {
 // puerto del receptor. Solo el dueño del derecho de recepción (el creador, o quien lo recibió con MOVE_RECEIVE) puede destruirlo.
 static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) p->owner = (int32_t)getpid(); unlock(); }
+static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto
+extern void diag_crash(ucontext_t* uc);
 static long t_destruct(struct ctx* c) {
+	if (getenv("TAHOE_STACKS")) { logf_("    destruct 0x%x:\n", (uint32_t)c->a[1]); diag_crash(c->uc); }
 	if (owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
 	return KERN_OK;
 }
@@ -530,7 +533,7 @@ void emu_port_init(void) {
 	reg_mach(70, t_voucher_create);
 	reg_mach(91, t_mk_create); reg_mach(92, t_mk_destroy); reg_mach(93, t_mk_arm); reg_mach(94, t_mk_cancel); reg_mach(95, t_mk_arm_leeway);
 	reg_mach(43, t_activity_id);
-	reg_mach(16, t_allocate); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
+	reg_mach(16, t_allocate); reg_mach(23, t_ret0); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
 	reg_mach(18, t_nop); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_insert_member);
 	reg_mach(26, t_reply_port); reg_mach(50, t_special_reply_port); reg_mach(76, t_type);
 }

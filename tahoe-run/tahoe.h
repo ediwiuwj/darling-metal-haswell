@@ -53,6 +53,8 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 void emu_sem_init(void);
 uint32_t sem_create(int value);
 uint32_t alloc_port(void);
+uint32_t tahoe_flags_fd(int fd);
+uint32_t tahoe_flags_path(const char* p);
 void port_move_receive(uint32_t name);
 long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64_t buf, uint32_t cap, uint32_t* total);
 uint32_t special_port_get(int which);

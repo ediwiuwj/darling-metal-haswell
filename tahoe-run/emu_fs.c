@@ -68,8 +68,14 @@ static long bsd_readlink(struct ctx* c) {
 	return safe_write(c->a[1], out, n) == n ? n : -D_EFAULT;
 }
 
+// Banderas BSD (st_flags: SF_RESTRICTED, UF_HIDDEN...): Linux no las tiene; se guardan como atributo extendido del archivo.
+// Hacen falta porque libsystem comprueba que rootless_mkdir_protected() dejó el directorio protegido.
+#include <sys/xattr.h>
+uint32_t tahoe_flags_fd(int fd) { uint32_t v = 0; if (fgetxattr(fd, "user.tahoe.flags", &v, 4) != 4) v = 0; return v; }
+uint32_t tahoe_flags_path(const char* p) { uint32_t v = 0; if (lgetxattr(p, "user.tahoe.flags", &v, 4) != 4) v = 0; return v; }
+
 // struct stat de Darwin con inodos de 64 bits (144 bytes)
-static void put_stat(uint64_t out, const struct stat* s) {
+static void put_stat(uint64_t out, const struct stat* s, uint32_t flags) {
 	uint8_t d[144];
 	memset(d, 0, sizeof d);
 #define W(type, off, v) do { type t_ = (type)(v); memcpy(d + (off), &t_, sizeof t_); } while (0)
@@ -87,6 +93,7 @@ static void put_stat(uint64_t out, const struct stat* s) {
 	W(int64_t, 96, s->st_size);
 	W(int64_t, 104, s->st_blocks);
 	W(int32_t, 112, s->st_blksize);
+	W(uint32_t, 116, flags);
 #undef W
 	safe_write(out, d, sizeof d);
 }
@@ -99,7 +106,7 @@ static long do_stat(struct ctx* c, int follow) {
 		if (trace_all) logf_("    stat(\"%s\") -> %s\n", p, strerror(errno));
 		return err();
 	}
-	put_stat(c->a[1], &s);
+	put_stat(c->a[1], &s, follow ? tahoe_flags_path(path) : tahoe_flags_path(path));
 	return 0;
 }
 static long bsd_stat64(struct ctx* c) { return do_stat(c, 1); }
@@ -107,7 +114,7 @@ static long bsd_lstat64(struct ctx* c) { return do_stat(c, 0); }
 static long bsd_fstat64(struct ctx* c) {
 	struct stat s;
 	if (fstat((int)c->a[0], &s) != 0) return err();
-	put_stat(c->a[1], &s);
+	put_stat(c->a[1], &s, tahoe_flags_fd((int)c->a[0]));
 	return 0;
 }
 
@@ -129,7 +136,11 @@ static long bsd_fstatat64(struct ctx* c) {
 		if (trace_all) logf_("    fstatat(%d, \"%s\") -> %s\n", (int)c->a[0], p, strerror(errno));
 		return err();
 	}
-	put_stat(c->a[2], &s);
+	uint32_t fl = 0;
+	if (dfd == AT_FDCWD || p[0] == '/') fl = tahoe_flags_path(path);
+	else if (p[0] == '\0') fl = tahoe_flags_fd(dfd);
+	else { int tf = openat(dfd, path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC); if (tf >= 0) { fl = tahoe_flags_fd(tf); close(tf); } }
+	put_stat(c->a[2], &s, fl);
 	return 0;
 }
 
