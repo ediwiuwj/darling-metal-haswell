@@ -714,10 +714,126 @@ static int32_t uc_smc(struct uc_call* c) {
 }
 static uc_method_fn uc_hook_for(const char* cls) { return !strcmp(cls, "AppleSMC") ? uc_smc : NULL; }
 
+// ------------------------------------------------------------------ traza (TAHOE_IOKIT=1): qué pide cada proceso
+static const struct { int id; const char* name; } io_names[] = {
+	{ 2800, "object_get_class" },
+	{ 2801, "object_conforms_to" },
+	{ 2802, "iterator_next" },
+	{ 2803, "iterator_reset" },
+	{ 2804, "service_get_matching_services" },
+	{ 2805, "registry_entry_get_property" },
+	{ 2806, "registry_create_iterator" },
+	{ 2807, "registry_iterator_enter_entry" },
+	{ 2808, "registry_iterator_exit_entry" },
+	{ 2809, "registry_entry_from_path" },
+	{ 2810, "registry_entry_get_name" },
+	{ 2811, "registry_entry_get_properties" },
+	{ 2812, "registry_entry_get_property_bytes" },
+	{ 2813, "registry_entry_get_child_iterator" },
+	{ 2814, "registry_entry_get_parent_iterator" },
+	{ 2815, "connect_map_shared_memory" },
+	{ 2816, "service_close" },
+	{ 2817, "connect_get_service" },
+	{ 2820, "connect_add_client" },
+	{ 2821, "connect_set_properties" },
+	{ 2826, "registry_entry_get_path" },
+	{ 2827, "registry_get_root_entry" },
+	{ 2828, "registry_entry_set_properties" },
+	{ 2829, "registry_entry_in_plane" },
+	{ 2830, "object_get_retain_count" },
+	{ 2831, "service_get_busy_state" },
+	{ 2832, "service_wait_quiet" },
+	{ 2833, "registry_entry_create_iterator" },
+	{ 2834, "iterator_is_valid" },
+	{ 2836, "catalog_send_data" },
+	{ 2837, "catalog_terminate" },
+	{ 2838, "catalog_get_data" },
+	{ 2839, "catalog_get_gen_count" },
+	{ 2840, "catalog_module_loaded" },
+	{ 2841, "catalog_reset" },
+	{ 2842, "service_request_probe" },
+	{ 2843, "registry_entry_get_name_in_plane" },
+	{ 2844, "service_match_property_table" },
+	{ 2852, "connect_get_notification_semaphore" },
+	{ 2854, "registry_entry_get_location_in_plane" },
+	{ 2855, "registry_entry_get_property_recursively" },
+	{ 2856, "service_get_state" },
+	{ 2857, "service_get_matching_services_ool" },
+	{ 2858, "service_match_property_table_ool" },
+	{ 2860, "object_get_superclass" },
+	{ 2861, "object_get_bundle_identifier" },
+	{ 2862, "service_open_extended" },
+	{ 2863, "connect_map_memory_into_task" },
+	{ 2864, "connect_unmap_memory_from_task" },
+	{ 2865, "connect_method" },
+	{ 2866, "connect_async_method" },
+	{ 2867, "connect_set_notification_port" },
+	{ 2868, "service_add_notification" },
+	{ 2869, "service_add_interest_notification" },
+	{ 2870, "service_add_notification_ool" },
+	{ 2871, "registry_entry_get_registry_entry_id" },
+	{ 2872, "connect_method_var_output" },
+	{ 2873, "service_get_matching_service" },
+	{ 2874, "service_get_matching_service_ool" },
+	{ 2875, "service_get_authorization_id" },
+	{ 2876, "service_set_authorization_id" },
+	{ 2877, "server_version" },
+	{ 2878, "registry_entry_get_properties_bin" },
+	{ 2879, "registry_entry_get_property_bin" },
+	{ 2880, "service_get_matching_service_bin" },
+	{ 2881, "service_get_matching_services_bin" },
+	{ 2882, "service_match_property_table_bin" },
+	{ 2884, "service_add_notification_bin" },
+	{ 2885, "registry_entry_get_path_ool" },
+	{ 2886, "registry_entry_from_path_ool" },
+	{ 2887, "device_tree_entry_exists_with_name" },
+	{ 2888, "registry_entry_get_properties_bin_buf" },
+	{ 2889, "registry_entry_get_property_bin_buf" },
+	{ 2890, "service_wait_quiet_with_options" },
+};
+static int io_trace = -1;
+static const char* io_name_of(int id) { for (unsigned i = 0; i < sizeof io_names / sizeof *io_names; i++) if (io_names[i].id == id) return io_names[i].name; return "?"; }
+static void io_log_req(const struct hdr* h, const uint8_t* req) {
+	if (io_trace < 0) io_trace = getenv("TAHOE_IOKIT") != NULL || access("/dev/shm/tahoe-iokit-trace", F_OK) == 0;   // el archivo sirve porque launchd no propaga el entorno
+	if (!io_trace) return;
+	struct rq q; rq_init(&q, h, req);
+	char who[200] = ""; int ent = obj_ent(h->remote);
+	if (ent >= 0) snprintf(who, sizeof who, " [%s:%s]", io_e[ent].cls, io_e[ent].name);
+	char arg[600] = "";
+	switch (h->id) {
+	case 2804: case 2873: case 2844: { rq_ndr(&q); snprintf(arg, sizeof arg, " %s", rq_str(&q)); break; }
+	case 2809: case 2805: case 2812: case 2843: case 2826: case 2829: case 2813: case 2814: case 2806: { rq_ndr(&q); snprintf(arg, sizeof arg, " \"%s\"", rq_str(&q)); break; }
+	case 2879: case 2889: case 2855: { rq_ndr(&q); const char* pl = rq_str(&q); const char* k = rq_str(&q); snprintf(arg, sizeof arg, " plano=%s clave=\"%s\" opciones=%u", pl, k, rq_u32(&q)); break; }
+	case 2868: case 2870: case 2884: {
+		rq_ndr(&q); const char* ty = rq_str(&q); struct val* m = NULL;
+		if (h->id == 2868) { const char* s = rq_str(&q); m = xml_parse(s, strlen(s)); } else if (h->id == 2870) m = rq_match_ool(&q);
+		else { uint32_t n; const uint8_t* b = rq_bytes(&q, &n); m = any_parse(b, n); }
+		struct sbuf b = { 0 }; if (m) xml_ser(&b, m); sb_put(&b, "\0", 1);
+		snprintf(arg, sizeof arg, " tipo=%s %s", ty, (char*)b.p); free(b.p); break;
+	}
+	case 2880: case 2881: case 2882: case 2857: case 2874: case 2858: {
+		rq_ndr(&q); struct val* m;
+		if (h->id == 2857 || h->id == 2874 || h->id == 2858) m = rq_match_ool(&q); else { uint32_t n; const uint8_t* b = rq_bytes(&q, &n); m = any_parse(b, n); }
+		struct sbuf b = { 0 }; if (m) xml_ser(&b, m); sb_put(&b, "\0", 1);
+		snprintf(arg, sizeof arg, " %s", (char*)b.p); free(b.p); break;
+	}
+	case 2862: { rq_ndr(&q); snprintf(arg, sizeof arg, " tipo=%u", rq_u32(&q)); break; }
+	case 2865: case 2866: case 2872: {
+		rq_ndr(&q); uint32_t sel = rq_u32(&q), ns = rq_u32(&q); int k = snprintf(arg, sizeof arg, " selector=%u escalares=%u:", sel, ns);
+		for (uint32_t i = 0; i < ns && i < 16 && k < 500; i++) k += snprintf(arg + k, sizeof arg - k, " 0x%llx", (unsigned long long)rq_u64(&q));
+		uint32_t nb; rq_bytes(&q, &nb); snprintf(arg + k, sizeof arg - k, " entrada=%uB", nb); break;
+	}
+	case 2863: case 2815: { rq_ndr(&q); snprintf(arg, sizeof arg, " memoria tipo=%u", rq_u32(&q)); break; }
+	case 2867: case 2852: { rq_ndr(&q); snprintf(arg, sizeof arg, " tipo=%u", rq_u32(&q)); break; }
+	}
+	logf_("    IOKIT <%d> %s(%d)%s%s\n", (int)getpid(), io_name_of(h->id), h->id, who, arg);
+}
+
 // ------------------------------------------------------------------ el servidor
 static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, int* handled) {
 	*handled = 1;
 	io_init();
+	io_log_req(h, req);
 	struct rq q;
 	rq_init(&q, h, req);
 	int ent = obj_ent(h->remote);
