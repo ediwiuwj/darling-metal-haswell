@@ -533,6 +533,20 @@ done:
 	if (trace_all || fd < 0) logf_("    open(\"%s\") -> %ld%s%s\n", path, fd, fd < 0 ? " " : "", fd < 0 ? strerror(errno) : "");
 	return fd < 0 ? -darwin_errno(errno) : fd;
 }
+// open_dprotected_np(ruta, oflags, clase, dpflags, mode): como open; la clase de protección de datos no existe aquí.
+static long bsd_open_dprotected(struct ctx* c) {
+	struct ctx c2 = *c;
+	c2.a[2] = c->a[4];
+	return bsd_open(&c2);
+}
+// getlogin(búfer, tamaño): el usuario de la sesión (los servicios corren como root).
+static long bsd_getlogin(struct ctx* c) {
+	static const char u[] = "root";
+	if (c->a[1] < sizeof u) return -34;                   // ERANGE
+	return safe_write(c->a[0], u, sizeof u) == (ssize_t)sizeof u ? 0 : -14;
+}
+static long bsd_enotsup(struct ctx* c) { (void)c; return -45; }   // ENOTSUP: funciones que este sistema no ofrece (personas)
+static long bsd_eperm(struct ctx* c) { (void)c; return -1; }      // EPERM: reboot desde dentro no apaga el anfitrión
 // guarded_open_np(ruta, guard*, guardflags, oflags, mode): como open; la guarda se ignora.
 static long bsd_guarded_open(struct ctx* c) {
 	struct ctx c2 = *c;
@@ -624,7 +638,7 @@ static long bsd_shared_region_check_np(struct ctx* c) {
 static bsd_fn bsd_table[BSD_NAMES_N] = {
 	[1] = bsd_exit, [3] = bsd_read, [4] = bsd_write, [6] = bsd_close, [20] = bsd_getpid,
 	[294] = bsd_shared_region_check_np, [327] = bsd_issetugid, [372] = bsd_thread_selfid, [483] = bsd_csrctl, [336] = bsd_proc_info,
-	[5] = bsd_open, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
+	[5] = bsd_open, [216] = bsd_open_dprotected, [49] = bsd_getlogin, [494] = bsd_enotsup, [55] = bsd_eperm, [441] = bsd_guarded_open, [442] = bsd_guarded_close, [48] = bsd_sigprocmask, [500] = bsd_getentropy, [520] = bsd_terminate_with_payload, [521] = bsd_abort_with_payload,
 };
 
 
@@ -944,11 +958,16 @@ int main(int argc, char** argv, char** envp) {
 	emu_port_init();
 	emu_sem_init();
 	emu_psynch_init();
+	emu_cs_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
-		{ 396, 3 }, { 400, 7 }, { 410, 111 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },
+		// todas las variantes *_nocancel de syscalls.master (sin puntos de cancelación, mismo efecto)
+		{ 395, 394 }, { 396, 3 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 400, 7 }, { 401, 27 }, { 402, 28 }, { 403, 29 }, { 404, 30 },
+		{ 405, 65 }, { 406, 92 }, { 407, 93 }, { 408, 95 }, { 409, 98 }, { 410, 111 }, { 411, 120 }, { 412, 121 }, { 413, 133 },
+		{ 414, 153 }, { 415, 154 }, { 416, 173 }, { 417, 230 }, { 418, 260 }, { 419, 261 }, { 420, 271 }, { 421, 315 }, { 422, 330 },
+		{ 423, 334 }, { 464, 463 }, { 542, 540 }, { 543, 541 },
 	};
-	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
+	for (size_t i = 0; i < sizeof alias / sizeof alias[0]; i++) if (bsd_table[alias[i].normal] && !bsd_table[alias[i].nocancel]) bsd_table[alias[i].nocancel] = bsd_table[alias[i].normal];
 	install_dispatch();
 	LOG("saltando a dyld (rip=0x%lx rsp=0x%lx)\n", di.entry, sp);
 	enter(di.entry, sp);

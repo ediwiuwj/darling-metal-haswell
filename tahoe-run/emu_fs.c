@@ -651,18 +651,6 @@ static long bsd_openat(struct ctx* c) {
 	return fd < 0 ? err() : fd;
 }
 
-// csops(pid, operación, búfer, tamaño): estado de la firma de código. 0 = sin firma ni restricciones.
-static long bsd_csops(struct ctx* c) {
-	uint32_t zero = 0;
-	if ((int)c->a[1] == 0 && c->a[3] >= 4) {                                                            // CS_OPS_STATUS
-		errno = 0;
-		ssize_t w = safe_write(c->a[2], &zero, 4);
-		if (w != 4) logf_("    csops: no pude escribir en 0x%lx (w=%zd errno=%d)\n", c->a[2], w, errno);
-		return w == 4 ? 0 : -D_EFAULT;
-	}
-	logf_("    csops: operación %d sin implementar\n", (int)c->a[1]);
-	return -D_EINVAL;
-}
 // fsgetpath(búfer, tamaño, fsid*, objid): ruta a partir de un identificador de archivo. Solo se conoce la
 // caché de dyld, cuyo identificador se publicó en la región dinámica (inodo en objid).
 static long bsd_fsgetpath(struct ctx* c) {
@@ -699,5 +687,5 @@ void emu_fs_init(void) {
 	reg_bsd(347, bsd_getfsstat64); reg_bsd(345, bsd_statfs64); reg_bsd(346, bsd_fstatfs64);
 	reg_bsd(242, bsd_fsctl); reg_bsd(220, bsd_getattrlist); reg_bsd(12, bsd_chdir); reg_bsd(13, bsd_fchdir); reg_bsd(344, bsd_getdirentries64); reg_bsd(461, bsd_getattrlistbulk);
 	reg_bsd(41, bsd_dup);      reg_bsd(90, bsd_dup2);     reg_bsd(470, bsd_fstatat64);
-	reg_bsd(463, bsd_openat);  reg_bsd(169, bsd_csops);   reg_bsd(427, bsd_fsgetpath);
+	reg_bsd(463, bsd_openat); reg_bsd(464, bsd_openat);   /* openat_nocancel */     reg_bsd(427, bsd_fsgetpath);
 }

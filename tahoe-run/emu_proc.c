@@ -125,13 +125,6 @@ static long bsd_connect(struct ctx* c) {
 	if (trace_all || r < 0) logf_("    connect(\"%s\") -> %s\n", un.path, r < 0 ? strerror(errno) : "ok");
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
-// csops_audittoken(pid, operación, búfer, tamaño, token*): sin firma de código, sin derechos (entitlements).
-static long bsd_csops_audittoken(struct ctx* c) {
-	uint32_t zero = 0;
-	if ((int)c->a[1] == 0 && c->a[3] >= 4) return safe_write(c->a[2], &zero, 4) == 4 ? 0 : -D_EFAULT;
-	return -D_ENOENT;
-}
-
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -983,7 +976,7 @@ void emu_proc_init(void) {
 	reg_bsd(194, bsd_getrlimit); reg_bsd(195, bsd_setrlimit);
 	reg_bsd(46, bsd_sigaction); reg_bsd(53, bsd_sigaltstack); reg_bsd(329, bsd_pthread_sigmask); reg_bsd(52, bsd_sigpending);
 	reg_bsd(37, bsd_kill); reg_bsd(328, bsd_pthread_kill);
-	reg_bsd(98, bsd_connect); reg_bsd(170, bsd_csops_audittoken);
+	reg_bsd(98, bsd_connect);
 	reg_bsd(97, bsd_socket);
 	reg_bsd(267, bsd_shm_unlink);
 	reg_bsd(116, bsd_gettimeofday); reg_bsd(266, bsd_shm_open); reg_bsd(54, bsd_ioctl);
