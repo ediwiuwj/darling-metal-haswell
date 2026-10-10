@@ -15,6 +15,7 @@
 //     los métodos devuelven kIOReturnUnsupported.
 
 #include <dirent.h>
+#include <sys/stat.h>
 #include <limits.h>
 
 #define IOKIT_RET(x) ((int32_t)(0xe0000000u | (x)))
@@ -712,7 +713,62 @@ static int32_t uc_smc(struct uc_call* c) {
 	memcpy(c->outband, c->inband, 80); c->outband[40] = 0x84; *c->noutband = 80; *c->nsout = 0;
 	return 0;
 }
-static uc_method_fn uc_hook_for(const char* cls) { return !strcmp(cls, "AppleSMC") ? uc_smc : NULL; }
+
+// IOHIDSystem (conexión kIOHIDServerConnectType): memoria compartida EvOffsets+EvGlobals con la cola de eventos de bajo nivel.
+// Desplazamientos medidos con clang sobre IOHIDShared.h del SDK: EvGlobals mide 23264 bytes.
+#define HID_SHM_SIZE 0x10000u
+#define EVG_SIZE     23264
+enum { G_ENUM = 4, G_BUTTONS = 8, G_CURSORLOC = 20, G_WORKBOUNDS = 28, G_VERSION = 44, G_STRUCTSIZE = 48, G_MOVEDMASK = 184,
+       G_LLEHEAD = 212, G_LLETAIL = 216, G_LLELAST = 220, G_LLEQ = 224, LLEQSIZE_ = 240, EQELEM_SIZE = 96 };
+static uint8_t* hid_shm;                                              // proyección propia (cada proceso mapea el mismo archivo)
+static void hid_path(char* b, size_t n) { snprintf(b, n, "/dev/shm/tahoe-hid-%s", getenv("TAHOE_PORTS_OWNER") ? getenv("TAHOE_PORTS_OWNER") : "x"); }
+static uint8_t* hid_map(void) {
+	if (hid_shm) return hid_shm;
+	char p[128]; hid_path(p, sizeof p);
+	int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+	if (fd < 0) return NULL;
+	struct stat st; fstat(fd, &st);
+	int fresh = st.st_size == 0;
+	if (fresh && ftruncate(fd, HID_SHM_SIZE) != 0) { close(fd); return NULL; }
+	uint8_t* m = mmap(NULL, HID_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	close(fd);
+	if (m == MAP_FAILED) return NULL;
+	if (fresh) {                                                       // lo que hace IOHIDSystem al crear la memoria
+		int32_t off[2] = { 8, 8 + EVG_SIZE }; memcpy(m, off, 8);
+		uint8_t* g = m + 8;
+		int32_t v = 4; memcpy(g + G_VERSION, &v, 4); v = EVG_SIZE; memcpy(g + G_STRUCTSIZE, &v, 4);
+		v = 1; memcpy(g + G_ENUM, &v, 4);
+		for (int i = 0; i < LLEQSIZE_; i++) { int32_t nx = i + 1 == LLEQSIZE_ ? 0 : i + 1; memcpy(g + G_LLEQ + i * EQELEM_SIZE, &nx, 4); }
+		v = 1; memcpy(g + G_LLEHEAD, &v, 4); memcpy(g + G_LLETAIL, &v, 4); v = 0; memcpy(g + G_LLELAST, &v, 4);
+		int16_t wb[4] = { 0, 1920, 0, 1080 }; memcpy(g + G_WORKBOUNDS, wb, 8);
+	}
+	hid_shm = m;
+	return m;
+}
+static int32_t uc_hid(struct uc_call* c) {
+	*c->noutband = 0; *c->nsout = 0;
+	switch (c->selector) {
+	case 0: {                                                          // createShmem(version)
+		if (c->nsin < 1 || c->sin[0] < 3 || c->sin[0] > 4) return kIOReturnBadArgument;
+		return hid_map() ? 0 : kIOReturnNoMemory;
+	}
+	case 1: case 2: return 0;                                          // setEventsEnable / setCursorEnable
+	case 4: {                                                          // setMouseLocation(x, y)
+		uint8_t* m = hid_map(); if (!m || c->nsin < 2) return kIOReturnBadArgument;
+		int16_t xy[2] = { (int16_t)c->sin[0], (int16_t)c->sin[1] }; memcpy(m + 8 + G_CURSORLOC, xy, 4);
+		return 0;
+	}
+	case 5: { uint8_t* m = hid_map(); if (!m) return kIOReturnNoMemory; *c->nsout = 1; c->sout[0] = *(int32_t*)(m + 8 + G_ENUM); return 0; }   // getButtonEventNum
+	default:
+		logf_("    iokit: IOHIDSystem selector %u sin implementar (%u escalares)\n", c->selector, c->nsin);
+		return kIOReturnUnsupported;
+	}
+}
+static uc_method_fn uc_hook_for(const char* cls) {
+	if (!strcmp(cls, "AppleSMC")) return uc_smc;
+	if (!strcmp(cls, "IOHIDSystem")) return uc_hid;
+	return NULL;
+}
 
 // ------------------------------------------------------------------ traza (TAHOE_IOKIT=1): qué pide cada proceso
 static const struct { int id; const char* name; } io_names[] = {
@@ -1106,7 +1162,22 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 	case 2816: if (self && self->kind == K_CONNECT) self->closed = 1; return rp_err(rep, h, KERN_SUCCESS_);
 	case 2817: if (!self || self->kind != K_CONNECT) return rp_err(rep, h, kIOReturnBadArgument); return reply_port(rep, h, ent_handle(self->ent), 17);
 	case 2820: case 2867: return rp_err(rep, h, KERN_SUCCESS_);                         // add_client / set_notification_port
-	case 2852: case 2815: case 2863: case 2864: case 2866: case 2872: case 2865: {
+	case 2863: {                                                                        // io_connect_map_memory_into_task
+		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
+		rq_ndr(&q); uint32_t mtype = rq_u32(&q); uint64_t addr = rq_u64(&q), size = rq_u64(&q); uint32_t flags = rq_u32(&q);
+		(void)addr; (void)flags;
+		if (!strcmp(io_e[self->ent].cls, "IOHIDSystem") && mtype == 0) {      // kIOHIDGlobalMemory
+			uint8_t* m = hid_map(); if (!m) return rp_err(rep, h, kIOReturnNoMemory);
+			size_t n = reply_begin(rep, h, KERN_SUCCESS_);
+			uint64_t a = (uint64_t)m, sz = HID_SHM_SIZE; (void)size;
+			memcpy(rep + n, &a, 8); memcpy(rep + n + 8, &sz, 8);
+			return n + 16;
+		}
+		logf_("    iokit: map_memory tipo=%u de %s sin implementar\n", mtype, io_e[self->ent].cls);
+		return rp_err(rep, h, kIOReturnUnsupported);
+	}
+	case 2864: return rp_err(rep, h, KERN_SUCCESS_);                                    // unmap: la proyección se conserva
+	case 2852: case 2815: case 2866: case 2872: case 2865: {
 		// 2865 io_connect_method: scalar_input[], inband_input, ool_input; salidas inband/scalar/ool. Sin gancho de clase: no soportado.
 		if (!self || self->kind != K_CONNECT || self->closed) return rp_err(rep, h, kIOReturnNoDevice);
 		uc_method_fn fn = uc_hook_for(io_e[self->ent].cls);
@@ -1118,6 +1189,7 @@ static size_t mig_iokit(const struct hdr* h, const uint8_t* req, uint8_t* rep, i
 		uint64_t sout[16] = { 0 }; uint32_t nsout = 16, nout = 4096; static __thread uint8_t outband[4096];
 		uc.sout = sout; uc.nsout = &nsout; uc.outband = outband; uc.noutband = &nout;
 		int32_t r = fn(&uc);
+		if (trace_all || r) logf_("    iokit: <%d> %s selector %u -> 0x%x\n", (int)getpid(), io_e[self->ent].cls, uc.selector, (unsigned)r);
 		if (r) return rp_err(rep, h, r);
 		size_t n = reply_begin(rep, h, KERN_SUCCESS_);
 		memcpy(rep + n, &nout, 4); memcpy(rep + n + 4, outband, nout); n += 4 + ((nout + 3) & ~3u);

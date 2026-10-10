@@ -14,11 +14,33 @@
 // que el kernel arranca hilos nuevos. Se guardan y se devuelve la máscara de capacidades.
 uint64_t thread_start_fn, wqthread_fn, pthread_size;
 static uint32_t tsd_offset, mach_thread_self_offset;   // desplazamiento del TSD dentro de pthread_t (struct _pthread_registration_data, +24)
+// work_interval_ctl(operación, id, arg, longitud): intervalos de trabajo del planificador (audio/gráficos en tiempo real).
+// No hay planificador que informar: se crean intervalos con un puerto propio y el resto de operaciones se aceptan.
+static long bsd_work_interval_ctl(struct ctx* c) {
+	static uint64_t next_id = 1;
+	switch ((uint32_t)c->a[0]) {
+	case 4: {                                                 // CREATE2: {id (entrada/salida), puerto, banderas}
+		uint8_t p[16] = { 0 };
+		if (safe_read(c->a[2], p, 16) != 16) return -D_EFAULT;
+		uint64_t id = next_id++; uint32_t port = alloc_port();
+		memcpy(p, &id, 8); memcpy(p + 8, &port, 4);
+		return safe_write(c->a[2], p, 16) == 16 ? 0 : -D_EFAULT;
+	}
+	case 9: { if (c->a[2] && c->a[3] >= 4) { uint32_t z = 0; safe_write(c->a[2], &z, 4); } return 0; }   // GET_FLAGS
+	default: return 0;                                        // DESTROY, NOTIFY, JOIN, SET_NAME, SET_WORKLOAD_ID
+	}
+}
 static long bsd_bsdthread_register(struct ctx* c) {
 	thread_start_fn = c->a[0];
 	wqthread_fn = c->a[1];
 	pthread_size = c->a[2];
-	if (c->a[3]) { safe_read(c->a[3] + 24, &tsd_offset, 4); safe_read(c->a[3] + 32, &mach_thread_self_offset, 4); }
+	if (c->a[3]) {
+		safe_read(c->a[3] + 24, &tsd_offset, 4); safe_read(c->a[3] + 32, &mach_thread_self_offset, 4);
+		// mutex_default_policy (+44): mutex y variables de condición basados en ulock (futex) en vez de psynch, que no se emula.
+		// 0x100 = _PTHREAD_REG_DEFAULT_USE_ULOCK; los 8 bits bajos son la política (3 = primer ajuste).
+		uint32_t pol = 0x100 | 3;
+		safe_write(c->a[3] + 44, &pol, 4);
+	}
 	if (trace_all) logf_("    bsdthread_register: tsd_offset=0x%x mts_offset=0x%x\n", tsd_offset, mach_thread_self_offset);
 	if (trace_all) logf_("    bsdthread_register: start=0x%lx wq=0x%lx pthread_size=0x%lx\n", thread_start_fn, wqthread_fn, pthread_size);
 	// Máscara de capacidades del kernel: libpthread exige FINEPRIO|BSDTHREADCTL|SETSELF|QOS_MAINTENANCE y
@@ -145,6 +167,12 @@ static long bsd_setrlimit(struct ctx* c) {
 	uint64_t in[2];
 	if (r < 0 || safe_read(c->a[1], in, 16) != 16) return -D_EINVAL;
 	struct rlimit rl = { in[0] == D_RLIM_INFINITY ? RLIM_INFINITY : in[0], in[1] == D_RLIM_INFINITY ? RLIM_INFINITY : in[1] };
+	// Los límites que fija launchd para cada servicio (NumberOfFiles, AS, DATA...) no deben bajar los del anfitrión: tahoe-run
+	// necesita descriptores altos y mucho espacio de direcciones para relanzarse, y un servicio sin ellos moría con exit(111).
+	if (r == RLIMIT_NOFILE) {
+		if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < 4096) rl.rlim_cur = 4096;
+		if (rl.rlim_max != RLIM_INFINITY && rl.rlim_max < 4096) rl.rlim_max = 4096;
+	} else if (r != RLIMIT_CORE) return 0;
 	return setrlimit(r, &rl) == 0 ? 0 : -darwin_errno(errno);
 }
 
@@ -698,6 +726,7 @@ void emu_proc_init(void) {
 	reg_bsd(428, bsd_audit_session_self);
 	reg_bsd(446, bsd_proc_rlimit_control);
 	reg_bsd(243, bsd_proc_rlimit_control);   // initgroups: sin efecto
+	reg_bsd(499, bsd_work_interval_ctl);
 	reg_bsd(440, bsd_proc_rlimit_control);   // memorystatus_control: sin efecto reg_bsd(444, bsd_proc_rlimit_control);   // change_fdguard_np
 	reg_bsd(552, bsd_proc_rlimit_control);   // record_system_event: sin efecto
 	reg_bsd(358, bsd_proc_rlimit_control);   // setaudit_addr: sin efecto

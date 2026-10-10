@@ -370,11 +370,11 @@ static long t_allocate(struct ctx* c) {
 	uint32_t n = port_create(c->a[1] == 3);
 	return safe_write(c->a[2], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
-// mach_port_construct_trap(task, options*, context, *name): options.flags & 2 = con derecho de envío
+// mach_port_construct_trap(task, options*, context, *name)
 static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
-	uint32_t n = port_create(flags & 8 /* MPO_PORTSET */);
+	uint32_t n = port_create(0);                     // construct nunca crea conjuntos (el bit 8 es MPO_IMPORTANCE_RECEIVER)
 	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u opt2=0x%x opt3=0x%x contexto=0x%lx\n", n, opt[0], opt[1], opt[2], opt[3], c->a[2]); }
 	return safe_write(c->a[3], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }

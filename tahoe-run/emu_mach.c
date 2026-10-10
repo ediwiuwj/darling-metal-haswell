@@ -407,6 +407,11 @@ static long mach_msg2(struct ctx* c) {
 	}
 	size_t n;
 	switch (h.id) {
+	case 3240: {                                                  // mach_port_is_connection_for_service(conexión, servicio) -> id de política de filtro
+		n = reply_begin(rep, &h, KERN_SUCCESS_);
+		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0
+		break;
+	}
 	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
