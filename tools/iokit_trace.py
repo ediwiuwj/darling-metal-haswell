@@ -1,9 +1,9 @@
 # Resume las peticiones IOKit por proceso a partir del registro de tahoe-run.
 # Uso: touch /dev/shm/tahoe-iokit-trace (activa la traza), arrancar launchd con TAHOE_LOGFILE=~/.claude-tmp/child.log, y luego:
 #   python3 tools/iokit_trace.py [líneas por proceso]
-import re,collections,sys
+import re,collections,sys,os
 names={}
-log=open('/home/eduardo/.claude-tmp/child.log',errors='replace').read().splitlines()
+log=open(os.environ.get('TAHOE_LOGFILE', os.path.expanduser('~/.claude-tmp/child.log')),errors='replace').read().splitlines()
 for l in log:
     m=re.search(r'<(\d+)> cargado (\S+)',l)
     if m and m.group(2)!='dyld': names[m.group(1)]=m.group(2)
