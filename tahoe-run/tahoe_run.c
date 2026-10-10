@@ -482,7 +482,7 @@ typedef emu_fn bsd_fn;
 
 // BSD: devuelven >= 0 o -errno_de_Darwin
 extern void ports_cleanup(void);
-static long bsd_exit(struct ctx* c)  { if (trace_all) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
+static long bsd_exit(struct ctx* c)  { if (trace_all || getpid() == 1) logf_("    exit(%d) <%d>\n", (int)c->a[0], getpid()); ports_cleanup(); _exit((int)c->a[0]); }
 static long bsd_getpid(struct ctx* c) { (void)c; return getpid(); }
 static long bsd_issetugid(struct ctx* c) { (void)c; return 0; }
 static long bsd_write(struct ctx* c) {
@@ -783,13 +783,19 @@ void reenable_dispatch(void) {
 // Prepara un hilo nuevo de Linux (pila alterna para SIGSYS + despacho) y salta al código de macOS con los
 // registros que XNU deja a thread_start: rdi=pthread, rsi=puerto, rdx=func, rcx=arg, r8=pila, r9=flags.
 extern __thread uint32_t g_thread_port;
+static __thread void* alt_stack;
+// El hilo del invitado terminó y su función del anfitrión va a volver: se quita el despacho de syscalls y la pila alterna.
+void guest_thread_done(void) {
+	selector = SYSCALL_DISPATCH_FILTER_ALLOW;
+	prctl(PR_SET_SYSCALL_USER_DISPATCH, PR_SYS_DISPATCH_OFF, 0, 0, 0);
+	if (alt_stack) { stack_t ss = { .ss_flags = SS_DISABLE }; sigaltstack(&ss, NULL); munmap(alt_stack, 1 << 18); alt_stack = NULL; }
+}
 void __attribute__((noreturn)) enter_guest_thread(uint64_t rip, uint64_t rsp, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
 	g_thread_port = (uint32_t)a1;
-	static __thread int alt_ready;                       // un hilo reutilizado vuelve a entrar: la pila alterna se crea una sola vez
-	if (!alt_ready) {
-		stack_t ss = { .ss_sp = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), .ss_size = 1 << 18 };
+	if (!alt_stack) {                                    // un hilo reutilizado vuelve a entrar: la pila alterna se crea una sola vez
+		alt_stack = mmap(NULL, 1 << 18, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		stack_t ss = { .ss_sp = alt_stack, .ss_size = 1 << 18 };
 		if (sigaltstack(&ss, NULL) != 0) DIE("hilo: sigaltstack: %s", strerror(errno));
-		alt_ready = 1;
 	}
 	reenable_dispatch();
 	selector = SYSCALL_DISPATCH_FILTER_BLOCK;
@@ -937,6 +943,7 @@ int main(int argc, char** argv, char** envp) {
 	emu_fs2_init();
 	emu_port_init();
 	emu_sem_init();
+	emu_psynch_init();
 	// Las variantes *_nocancel de Darwin son iguales a las normales salvo por el punto de cancelación de hilos.
 	static const struct { unsigned nocancel, normal; } alias[] = {
 		{ 396, 3 }, { 400, 7 }, { 410, 111 }, { 397, 4 }, { 398, 5 }, { 399, 6 }, { 406, 92 }, { 409, 98 }, { 414, 153 }, { 415, 154 },

@@ -12,6 +12,9 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 
+#include <sched.h>
+#include <sys/syscall.h>
+#include <time.h>
 #include "tahoe.h"
 
 #include <fcntl.h>
@@ -255,7 +258,7 @@ int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, u
 	int waited = 0;
 	for (;;) {
 		struct sport* p = find_locked(name);
-		if (!p) { unlock(); return waited ? 0x10004009 /* MACH_RCV_PORT_DIED */ : 0x10004008 /* MACH_RCV_INVALID_NAME */; }
+		if (!p) { unlock(); return waited ? MACH_RCV_PORT_DIED_ : MACH_RCV_INVALID_NAME_; }
 		struct sport* src = NULL;
 		if (!p->is_set) src = p->count ? p : NULL;
 		else for (int i = 0; i < MAXPORTS; i++) if (shm->ports[i].used && shm->ports[i].set == name && shm->ports[i].count) { src = &shm->ports[i]; break; }
@@ -396,14 +399,17 @@ void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(na
 static long t_ret0(struct ctx* c) { (void)c; return KERN_OK; }   // extract_member: sin efecto
 extern void diag_crash(ucontext_t* uc);
 static long t_destruct(struct ctx* c) {
-	if (getenv("TAHOE_STACKS")) { logf_("    destruct 0x%x:\n", (uint32_t)c->a[1]); diag_crash(c->uc); }
+	if (diag_target()) { logf_("    destruct 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_crash(c->uc); }
 	if (owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
 	return KERN_OK;
 }
 // mach_port_mod_refs_trap(task, name, right, delta): quitar la última referencia de recepción destruye el puerto
 static long t_mod_refs(struct ctx* c) {
 	int32_t delta = (int32_t)c->a[3];
-	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && owns((uint32_t)c->a[1])) destroy((uint32_t)c->a[1]);
+	if (c->a[2] == 1 /* RECEIVE */ && delta < 0 && owns((uint32_t)c->a[1])) {
+		if (diag_target()) { logf_("    mod_refs RECEIVE -1 0x%x (hilo %ld):\n", (uint32_t)c->a[1], (long)syscall(SYS_gettid)); diag_crash(c->uc); }
+		destroy((uint32_t)c->a[1]);
+	}
 	return KERN_OK;
 }
 static long t_nop(struct ctx* c) { (void)c; return KERN_OK; }
@@ -425,6 +431,13 @@ static long t_type(struct ctx* c) {
 	unlock();
 	if (!t) return KERN_INVALID_NAME_;
 	return safe_write(c->a[2], &t, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
+}
+// thread_switch(hilo, opción, ms): ceder la CPU. Con OSLOCK_WAIT/WAIT (4/2) se espera el tiempo indicado; si no, solo se cede.
+static long t_thread_switch(struct ctx* c) {
+	uint32_t opt = (uint32_t)c->a[1], ms = (uint32_t)c->a[2];
+	if ((opt == 2 || opt == 4) && ms) { struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
+	else sched_yield();
+	return 0;
 }
 static long t_reply_port(struct ctx* c) { (void)c; return port_create(0); }
 // thread_get_special_reply_port: cada hilo tiene UN puerto de respuesta especial que se reutiliza mientras exista
@@ -546,5 +559,5 @@ void emu_port_init(void) {
 	reg_mach(43, t_activity_id);
 	reg_mach(16, t_allocate); reg_mach(23, t_ret0); reg_mach(24, t_construct); reg_mach(25, t_destruct); reg_mach(19, t_mod_refs);
 	reg_mach(18, t_nop); reg_mach(21, t_nop); reg_mach(22, t_insert_member); reg_mach(20, t_insert_member);
-	reg_mach(26, t_reply_port); reg_mach(50, t_special_reply_port); reg_mach(76, t_type);
+	reg_mach(26, t_reply_port); reg_mach(61, t_thread_switch); reg_mach(50, t_special_reply_port); reg_mach(76, t_type);
 }

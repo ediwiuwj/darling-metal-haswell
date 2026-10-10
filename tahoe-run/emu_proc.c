@@ -244,13 +244,57 @@ static long bsd_kill(struct ctx* c) {
 	long r = syscall(SYS_kill, (int)c->a[0], ls);
 	return r < 0 ? -darwin_errno(errno) : 0;
 }
+// Diagnóstico dirigido: 1 si este proceso es el indicado en /dev/shm/tahoe-stacks (subcadena de su línea de órdenes).
+int diag_target(void) {
+	static int want = -1;
+	if (want < 0) {
+		char nm[64] = "", cl[512] = "";
+		FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
+		f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
+		want = nm[0] && strstr(cl, nm) != NULL;
+	}
+	return want;
+}
+// Lee los mensajes de aborto de todas las imágenes de la caché compartida (mapeada en 0x7ff800000000, sin slide).
+static void crash_messages(void) {
+	const uint64_t cache = 0x7ff800000000UL;
+	uint32_t io = 0, ic = 0;
+	if (safe_read(cache + 0x1c0, &io, 4) != 4 || safe_read(cache + 0x1c4, &ic, 4) != 4 || !ic || ic > 10000) return;
+	for (uint32_t i = 0; i < ic; i++) {
+		uint64_t mh = 0; uint32_t pathoff = 0;
+		if (safe_read(cache + io + i * 32ULL, &mh, 8) != 8 || safe_read(cache + io + i * 32ULL + 24, &pathoff, 4) != 4) continue;
+		uint32_t hdr[8];
+		if (safe_read(mh, hdr, 32) != 32 || hdr[0] != 0xfeedfacf) continue;
+		uint64_t lc = mh + 32;
+		for (uint32_t c = 0; c < hdr[4] && c < 128; c++) {
+			uint32_t cmd[2];
+			if (safe_read(lc, cmd, 8) != 8 || cmd[1] < 8) break;
+			if (cmd[0] == 0x19) {                                        // LC_SEGMENT_64
+				uint32_t nsect = 0; safe_read(lc + 64, &nsect, 4);
+				for (uint32_t s = 0; s < nsect && s < 64; s++) {
+					char sname[17] = { 0 }; uint64_t addr = 0;
+					uint64_t so = lc + 72 + s * 80ULL;
+					safe_read(so, sname, 16); safe_read(so + 32, &addr, 8);
+					if (strcmp(sname, "__crash_info") != 0) continue;
+					uint64_t m1 = 0, m2 = 0; char t1[300] = "", t2[300] = "", path[160] = "";
+					safe_read(addr + 8, &m1, 8); safe_read(addr + 32, &m2, 8);
+					if (m1) safe_string(m1, t1, sizeof t1);
+					if (m2) safe_string(m2, t2, sizeof t2);
+					if (t1[0] || t2[0]) {
+						safe_string(cache + pathoff, path, sizeof path);
+						const char* b = strrchr(path, '/');
+						logf_("    abort <%d>: [%s] \"%s\"%s%s\n", (int)getpid(), b ? b + 1 : path, t1, t2[0] ? " / " : "", t2);
+					}
+				}
+			}
+			lc += cmd[1];
+		}
+	}
+}
 void diag_crash(ucontext_t* uc) {
-		// SIGABRT: libpthread/libsystem dejan el motivo en su anotación de crash. Esta dirección es de la caché
-		// concreta de macOS 26.6.2 (gCRAnnotations.message de libsystem_pthread); sirve solo para diagnosticar.
-		uint64_t msgp = 0;
-		char msg[256] = "";
-		if (safe_read(0x7ff8430937b0UL, &msgp, 8) == 8 && msgp && safe_string(msgp, msg, sizeof msg) == 0 && msg[0])
-			logf_("    abort <%d>: \"%s\"\n", (int)getpid(), msg);
+		// Motivo del aborto: cada librería que llama a abort/CRASH deja su texto en gCRAnnotations, en su sección
+		// __DATA*,__crash_info (message en +8, message2 en +32). Se recorren las imágenes de la caché compartida.
+		crash_messages();
 		{
 			// Retornos plausibles: valores de la pila dentro de la caché cuya instrucción anterior es un "call".
 			uint64_t sk[512] = { 0 };
@@ -483,6 +527,11 @@ static long bsd_bsdthread_ctl(struct ctx* c) {
 
 // bsdthread_create(func, arg, stack, pthread, flags): crea un hilo de Linux que arranca en thread_start (el
 // punto de entrada que libpthread registró en bsdthread_register) con la pila que eligió libpthread.
+// Salidas de los hilos del invitado: al terminar (bsdthread_terminate) o aparcarse (workq_kernreturn) se vuelve con
+// siglongjmp a la función del anfitrión que los lanzó, para que el pthread de Linux termine normalmente y libere su pila.
+static __thread sigjmp_buf thr_exit, wq_park;
+static __thread int thr_exit_ok, wq_park_ok, wq_terminated;
+extern void guest_thread_done(void);
 struct new_thread { uint64_t pthread, func, arg, stack, flags; };
 extern void enter_guest_thread(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) __attribute__((noreturn));
 static void* thread_main(void* p) {
@@ -496,7 +545,12 @@ static void* thread_main(void* p) {
 	// cada hilo tiene su propio nombre de puerto (os_unfair_lock lo usa como dueño)
 	if (mach_thread_self_offset) *(uint32_t*)(t.pthread + tsd_offset + mach_thread_self_offset) = kport;   // el kernel deja aquí el puerto del hilo (relativo al TSD)
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, t.pthread + tsd_offset); flags |= 0x10000000u; }
-	enter_guest_thread(thread_start_fn, t.stack, t.pthread, kport, t.func, t.arg, t.stack, flags);
+	if (sigsetjmp(thr_exit, 1) == 0) {
+		thr_exit_ok = 1;
+		enter_guest_thread(thread_start_fn, t.stack, t.pthread, kport, t.func, t.arg, t.stack, flags);
+	}
+	guest_thread_done();                                             // pthread de Linux termina y libera su pila
+	return NULL;
 }
 static long bsd_bsdthread_create(struct ctx* c) {
 	struct new_thread* t = malloc(sizeof *t);
@@ -516,7 +570,11 @@ static long bsd_bsdthread_create(struct ctx* c) {
 // bsdthread_terminate(stackaddr, freesize, port, sem): libera la pila del hilo y termina solo este hilo.
 static long bsd_bsdthread_terminate(struct ctx* c) {
 	if (mach_trace()) logf_("    THR <%d> termina hilo\n", (int)getpid());
+	// Hilo del grupo: su pila la reservó este emulador (wq_main la libera). libpthread calcula el rango a liberar con su
+	// propia idea de la pila del núcleo y podría alcanzar memoria vecina (la pila del anfitrión), así que se ignora.
+	if (wq_park_ok) { wq_terminated = 1; siglongjmp(wq_park, 1); }
 	if (c->a[0] && c->a[1]) munmap((void*)c->a[0], c->a[1]);
+	if (thr_exit_ok) siglongjmp(thr_exit, 1);                        // hilo de bsdthread_create: termina su función normalmente
 	syscall(SYS_exit, 0);
 	return 0;
 }
@@ -531,10 +589,13 @@ static long bsd_bsdthread_terminate(struct ctx* c) {
 #define WQ_KEVENT     0x00080000u
 #define WQ_TSD_SET    0x00200000u
 #define WQ_WORKLOOP   0x00400000u
+#define WQ_REUSE      0x00020000u   // el hilo ya pasó por libpthread: su pthread_t sigue en la lista y no se reinicia
 #define WQ_STACK      (1u << 20)
 static __thread uint64_t my_workloop;   // workloop que atiende este hilo
-struct wq_job { uint64_t kqid; int workloop, has_req; uint8_t req[72]; struct wq_job* next; };
-struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };
+#define WQ_DATA_SIZE 32768
+// npre/pre/pdata: eventos que el vigilante ya recogió del kqueue (y el búfer donde quedaron los mensajes Mach recibidos).
+struct wq_job { uint64_t kqid; int workloop, has_req, npre; uint8_t req[72]; uint8_t pre[16 * 72]; uint8_t* pdata; struct wq_job* next; };
+struct wl_state { uint64_t kqid; int running, pending, watching, has_req; uint8_t req[72]; struct wl_state* next; };   // watching: ya tiene vigilante
 extern int kq_workloop_fd(uint64_t);
 extern long kq_drain(uint64_t, uint64_t, int, uint64_t, uint64_t);
 static void wl_arm(uint64_t kqid);
@@ -561,33 +622,38 @@ static pthread_mutex_t wq_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t wq_pool_cv = PTHREAD_COND_INITIALIZER;
 static struct wq_job* wq_queue_head; static struct wq_job** wq_queue_tail = &wq_queue_head;
 static int wq_live, wq_idle;
-static __thread sigjmp_buf wq_park;
-static __thread int wq_park_ok;
 
-static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize) {
-	struct wq_job j = *jp;
+// first: primer servicio de este hilo (libpthread inicializa su pthread_t). exit_thread: en vez de trabajo, la llamada de
+// salida de XNU (nkevents = -1, WORKQ_EXIT_THREAD_NKEVENT) para que libpthread retire el hilo de su lista y lo termine.
+static void wq_run_job(const struct wq_job* jp, uint8_t* base, size_t psize, int first, int exit_thread) {
+	struct { uint64_t kqid; int workloop, has_req; uint8_t req[72]; } j = { jp->kqid, jp->workloop, jp->has_req, { 0 } };
+	memcpy(j.req, jp->req, 72);
 	uint64_t self = (uint64_t)base + WQ_STACK;
-	memset(base + WQ_STACK - 0x3000, 0, 0x3000 + psize);          // pthread_t y cabecera limpios para el nuevo servicio
+	if (first) memset(base + WQ_STACK - 0x3000, 0, 0x3000 + psize);   // pthread_t limpio solo la primera vez
 	uint64_t kqid_slot = self - 0x2000, events = kqid_slot + 8;
 	uint64_t flags = WQ_NEWSPI | WQ_PRIO_QOS | 5 /* THREAD_QOS_DEFAULT */;
 	if (tsd_offset) { syscall(SYS_arch_prctl, 0x1001 /*ARCH_SET_GS*/, self + tsd_offset); flags |= WQ_TSD_SET; }
+	if (!first) flags |= WQ_REUSE;
 	int nev = 0;
 	my_workloop = j.workloop ? j.kqid : 0;
 	static __thread uint8_t* data;                                   // búfer de datos (32 KB) de los mensajes Mach, uno por hilo
+	if (exit_thread) { j.workloop = 0; nev = -1; }
 	if (j.workloop) { *(uint64_t*)kqid_slot = j.kqid; flags |= (j.kqid == ~0ULL ? 0 : WQ_WORKLOOP) | WQ_KEVENT; if (j.has_req) { memcpy((void*)events, j.req, 72); nev = 1; }
-		if (!data) data = mmap(NULL, 32768 + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		uint64_t* avail = (uint64_t*)(data + 32768);
-		*avail = 32768;
-		long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
-		if (mach_trace()) { static _Atomic int cn; if (atomic_fetch_add(&cn, 1) < 400) logf_("    kq_drain <%d> kqid=0x%lx req=%d -> %ld eventos\n", (int)getpid(), (unsigned long)j.kqid, j.has_req, d); }
-		if (d > 0) nev += (int)d; }
+		if (jp->npre) { memcpy((void*)(events + nev * 72), jp->pre, (size_t)jp->npre * 72); nev += jp->npre; }   // ya recogidos por el vigilante
+		else {
+			if (!data) data = mmap(NULL, WQ_DATA_SIZE + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			uint64_t* avail = (uint64_t*)(data + WQ_DATA_SIZE);
+			*avail = WQ_DATA_SIZE;
+			long d = kq_drain(j.kqid, events + nev * 72, 16 - nev, (uint64_t)data, (uint64_t)avail);
+			if (d > 0) nev += (int)d;
+		} }
 	if (trace_all) logf_("    wqthread: %s kqid=0x%lx pthread=0x%lx flags=0x%lx\n", j.workloop ? "workloop" : "worker", j.kqid, self, flags);
 	if (sigsetjmp(wq_park, 1) == 0) {
 		wq_park_ok = 1;
 		static __thread uint32_t kp_cache; if (!kp_cache) kp_cache = alloc_port();
 		uint32_t kp = kp_cache;
 		if (mach_trace()) logf_("    THR <%d:%ld> hilo de cola puerto 0x%x\n", (int)getpid(), (long)syscall(SYS_gettid), kp);
-		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)nev);
+		enter_guest_thread(wqthread_fn, self - 0x3000, self, kp, (uint64_t)base, j.workloop ? events : 0, flags, (uint64_t)(int64_t)nev);
 	}
 	wq_park_ok = 0;                                                  // volvió el hilo aparcado
 }
@@ -598,9 +664,13 @@ static void* wq_main(void* p) {
 	uint8_t* base = mmap(NULL, WQ_STACK + psize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	struct wq_job* job = first;
 	if (base == MAP_FAILED) { free(first); pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); return NULL; }
+	int first_use = 1;
 	for (;;) {
-		wq_run_job(job, base, psize);
+		wq_run_job(job, base, psize, first_use, 0);
+		first_use = 0;
+		if (job->pdata) munmap(job->pdata, WQ_DATA_SIZE + 4096);
 		free(job);
+		if (wq_terminated) { pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); guest_thread_done(); munmap(base, WQ_STACK + psize); return NULL; }   // pthread_exit dentro de un trabajo
 		pthread_mutex_lock(&wq_pool_lock);
 		job = NULL;
 		for (;;) {
@@ -615,14 +685,16 @@ static void* wq_main(void* p) {
 		if (!job) { wq_live--; pthread_mutex_unlock(&wq_pool_lock); break; }
 		pthread_mutex_unlock(&wq_pool_lock);
 	}
+	// Inactivo: como XNU, se devuelve el hilo a libpthread con la llamada de salida; libpthread lo quita de su lista y
+	// llama a bsdthread_terminate, que libera la pila del invitado y vuelve aquí.
+	struct wq_job bye = { 0 };
+	wq_run_job(&bye, base, psize, 0, 1);
+	guest_thread_done();
 	munmap(base, WQ_STACK + psize);
 	return NULL;
 }
 
-static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
-	struct wq_job* j = calloc(1, sizeof *j);
-	j->kqid = kqid; j->workloop = workloop;
-	if (req) { j->has_req = 1; memcpy(j->req, req, 72); }
+static void wq_spawn_job(struct wq_job* j) {
 	pthread_mutex_lock(&wq_pool_lock);
 	if (wq_idle > 0 || wq_live >= WQ_MAX_HILOS) {                  // un hilo libre la atiende, o espera turno
 		*wq_queue_tail = j; wq_queue_tail = &j->next;
@@ -636,7 +708,14 @@ static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 1 << 20);
 	pthread_t th;
-	if (pthread_create(&th, &at, wq_main, j)) { free(j); pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); }
+	if (pthread_create(&th, &at, wq_main, j)) { if (j->pdata) munmap(j->pdata, WQ_DATA_SIZE + 4096); free(j); pthread_mutex_lock(&wq_pool_lock); wq_live--; pthread_mutex_unlock(&wq_pool_lock); }
+}
+static void wq_spawn(uint64_t kqid, int workloop, const uint8_t* req) {
+	struct wq_job* j = calloc(1, sizeof *j);
+	if (!j) return;
+	j->kqid = kqid; j->workloop = workloop;
+	if (req) { j->has_req = 1; memcpy(j->req, req, 72); }
+	wq_spawn_job(j);
 }
 
 // Petición de hilo para un workloop (EVFILT_WORKLOOP con NOTE_WL_THREAD_REQUEST). Un solo hilo por workloop a la vez.
@@ -654,35 +733,80 @@ void wq_request_workloop(uint64_t kqid, const void* req) {
 	if (start) wq_spawn(kqid, 1, copy);
 }
 
+static pthread_cond_t wl_cv = PTHREAD_COND_INITIALIZER;     // avisa a los vigilantes de que su workloop quedó libre
+
 static void wl_finished(uint64_t kqid) {
 	pthread_mutex_lock(&wl_lock);
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	int again = w && w->pending && req_still_valid(w->req);
-	if (w) { w->pending = 0; w->running = again; }
-	pthread_mutex_unlock(&wl_lock);
 	uint8_t copy[72];
-	if (w) memcpy(copy, w->req, 72);
+	if (w) { w->pending = 0; w->running = again; memcpy(copy, w->req, 72); }
+	pthread_cond_broadcast(&wl_cv);
+	pthread_mutex_unlock(&wl_lock);
 	if (again) wq_spawn(kqid, 1, copy); else wl_arm(kqid);
 }
 
-// Vigilante de un workloop inactivo: cuando su kqueue tiene eventos listos, lanza el hilo que los atiende.
+// Vigilante de un workloop: un hilo fijo por workloop. Mientras el workloop no tiene hilo, espera a que su kqueue esté
+// listo, recoge él mismo los eventos y solo entonces lanza un hilo con ellos. poll() sobre un epoll puede avisar en
+// falso (el aviso de un puerto ya se consumió por otra vía); en ese caso no se lanza nada y se vuelve a esperar.
 static void* wl_watch(void* p) {
 	uint64_t kqid = (uint64_t)p;
-	struct pollfd pf = { .fd = kq_workloop_fd(kqid), .events = POLLIN };
-	if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx fd=%d espera\n", (int)getpid(), (unsigned long)kqid, pf.fd);
+	int fd = kq_workloop_fd(kqid);
+	pthread_mutex_lock(&wl_lock);
+	struct wl_state* w = wl_states;
+	while (w && w->kqid != kqid) w = w->next;
+	pthread_mutex_unlock(&wl_lock);
+	if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx fd=%d inicia (w=%p)\n", (int)getpid(), (unsigned long)kqid, fd, (void*)w);
+	if (!w || fd < 0) return NULL;
 	for (;;) {
-		if (poll(&pf, 1, -1) < 0 && errno != EINTR) break;
-		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx despierta revents=0x%x\n", (int)getpid(), (unsigned long)kqid, pf.revents);
+		pthread_mutex_lock(&wl_lock);
+		while (w->running) pthread_cond_wait(&wl_cv, &wl_lock);
+		pthread_mutex_unlock(&wl_lock);
+		struct pollfd pf = { .fd = fd, .events = POLLIN };
+		if (poll(&pf, 1, -1) < 0) { if (errno == EINTR) continue; logf_("    wl_watch <%d>: poll falló: %s\n", (int)getpid(), strerror(errno)); break; }
 		if (!(pf.revents & POLLIN)) continue;
 		pthread_mutex_lock(&wl_lock);
-		struct wl_state* w = wl_states;
-		while (w && w->kqid != kqid) w = w->next;
-		int go = w && !w->running;
-		if (w) { w->watching = 0; if (go) w->running = 1; }
+		if (w->running) { pthread_mutex_unlock(&wl_lock); continue; }   // otra petición ya lanzó el hilo
+		w->running = 1;
 		pthread_mutex_unlock(&wl_lock);
-		if (go) wq_spawn(kqid, 1, NULL);
-		break;
+		struct wq_job* j = calloc(1, sizeof *j);
+		uint8_t* data = mmap(NULL, WQ_DATA_SIZE + 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		long d = 0;
+		if (j && data != MAP_FAILED) {
+			uint64_t* avail = (uint64_t*)(data + WQ_DATA_SIZE);
+			*avail = WQ_DATA_SIZE;
+			d = kq_drain(kqid, (uint64_t)j->pre, 16, (uint64_t)data, (uint64_t)avail);
+		}
+		if (mach_trace()) logf_("    wl_watch <%d> kqid=0x%lx recogió %ld\n", (int)getpid(), (unsigned long)kqid, d);
+		if (d > 0) {
+			j->kqid = kqid; j->workloop = 1; j->npre = (int)d; j->pdata = data;
+			wq_spawn_job(j);
+			continue;
+		}
+		free(j);
+		if (data != MAP_FAILED) munmap(data, WQ_DATA_SIZE + 4096);
+		static __thread int fails; static __thread int dumped;
+		if (++fails == 2000 && !dumped && mach_trace()) {             // diagnóstico: qué descriptor mantiene listo el epoll sin dar eventos
+			dumped = 1;
+			char pth[64], ln[256]; snprintf(pth, sizeof pth, "/proc/self/fdinfo/%d", fd);
+			FILE* f = fopen(pth, "r");
+			while (f && fgets(ln, sizeof ln, f)) {
+				int tfd = -1; unsigned ev = 0; unsigned long long dat = 0;
+				if (sscanf(ln, "tfd: %d events: %x data: %llx", &tfd, &ev, &dat) >= 2) {
+					char lk[128] = "", fp[64]; snprintf(fp, sizeof fp, "/proc/self/fd/%d", tfd); ssize_t n = readlink(fp, lk, sizeof lk - 1); if (n > 0) lk[n] = 0;
+					struct pollfd q = { .fd = tfd, .events = POLLIN | POLLOUT }; poll(&q, 1, 0);
+					logf_("    wl_watch <%d> fd %d en epoll %d: eventos=0x%x listo=0x%x knote=0x%llx %s\n", (int)getpid(), tfd, fd, ev, q.revents, dat, lk);
+				}
+			}
+			if (f) fclose(f);
+		}
+		pthread_mutex_lock(&wl_lock);                               // aviso falso: liberar, salvo que entretanto llegara una petición
+		int again = w->pending && req_still_valid(w->req);
+		uint8_t copy[72]; memcpy(copy, w->req, 72);
+		w->pending = 0; w->running = again;
+		pthread_mutex_unlock(&wl_lock);
+		if (again) wq_spawn(kqid, 1, copy);
 	}
 	return NULL;
 }
@@ -691,12 +815,15 @@ static void wl_arm(uint64_t kqid) {
 	struct wl_state* w = wl_states;
 	while (w && w->kqid != kqid) w = w->next;
 	if (!w) { w = calloc(1, sizeof *w); w->kqid = kqid; w->next = wl_states; wl_states = w; }
-	int start = !w->running && !w->watching;
+	int start = !w->watching;
 	if (start) w->watching = 1;
+	if (mach_trace()) logf_("    wl_arm <%d> kqid=0x%lx start=%d running=%d\n", (int)getpid(), (unsigned long)kqid, start, w->running);
+	pthread_cond_broadcast(&wl_cv);
 	pthread_mutex_unlock(&wl_lock);
 	if (!start) return;
 	pthread_attr_t at; pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+	pthread_attr_setstacksize(&at, 1 << 21);   // el TLS estático del emulador (búferes de mach_msg) vive en esta pila
 	pthread_t th;
 	if (pthread_create(&th, &at, wl_watch, (void*)kqid)) { pthread_mutex_lock(&wl_lock); w->watching = 0; pthread_mutex_unlock(&wl_lock); }
 }
@@ -767,10 +894,29 @@ static void* wait_dump_thread(void* a) {
 	for (int i = 0; i < 256; i++) if (wait_tab[i].tid) logf_("    WAITTAB tid=%ld addr=%p esperado=0x%x op=0x%lx valor_actual=0x%x (%lx)\n", wait_tab[i].tid, (void*)wait_tab[i].addr, wait_tab[i].expect, (unsigned long)wait_tab[i].op, *wait_tab[i].addr, (unsigned long)((uint64_t*)wait_tab[i].addr)[0]);
 	return NULL;
 }
-// XNU devuelve de ulock_wait cuántos hilos más siguen esperando en esa dirección; libplatform (os_unfair_lock) lo usa para
-// no marcar la cerradura "sin esperadores" al adquirirla tras despertar: si siempre fuera 0, quedarían hilos dormidos
-// sin que nadie los despierte. Contadores por cubo de dirección (una colisión solo sobreestima, lo que es inocuo).
-static _Atomic int ulock_waiters[1024];
+// XNU devuelve de ulock_wait cuántos hilos más siguen esperando en esa dirección (también cuando el valor ya no
+// coincidía). libplatform lo usa para no marcar un os_unfair_lock "sin esperadores" al adquirirlo tras despertar; y
+// libdispatch aborta si una espera de la que es el único dueño devuelve > 0. Por eso la cuenta es exacta por dirección.
+struct uwait { uintptr_t addr; int n; struct uwait* next; };
+static struct uwait* uwait_tab[1024];
+static pthread_mutex_t uwait_lock = PTHREAD_MUTEX_INITIALIZER;
+static void uwait_enter(uintptr_t a) {
+	pthread_mutex_lock(&uwait_lock);
+	struct uwait** b = &uwait_tab[(a >> 2) & 1023], *w = *b;
+	while (w && w->addr != a) w = w->next;
+	if (!w) { w = calloc(1, sizeof *w); w->addr = a; w->next = *b; *b = w; }
+	w->n++;
+	pthread_mutex_unlock(&uwait_lock);
+}
+static int uwait_leave(uintptr_t a) {                // devuelve cuántos quedan esperando
+	pthread_mutex_lock(&uwait_lock);
+	struct uwait** pp = &uwait_tab[(a >> 2) & 1023];
+	while (*pp && (*pp)->addr != a) pp = &(*pp)->next;
+	int left = 0;
+	if (*pp) { left = --(*pp)->n; if (left <= 0) { struct uwait* d = *pp; *pp = d->next; free(d); left = 0; } }
+	pthread_mutex_unlock(&uwait_lock);
+	return left;
+}
 static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	uint32_t* addr = (uint32_t*)c->a[1];
 	uint32_t expect = (uint32_t)c->a[2];
@@ -778,10 +924,7 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 	if (timeout_ns) { ts.tv_sec = timeout_ns / 1000000000ULL; ts.tv_nsec = timeout_ns % 1000000000ULL; tp = &ts; }
 	if (c->a[0] & 0x1000000) c->raw_ret = 1;     // ULF_NO_ERRNO
 	if (mach_trace()) {                          // diagnóstico: pila de cada hilo que se bloquea sin plazo en el proceso indicado por /dev/shm/tahoe-stacks
-		static int want = -1;
-		if (want < 0) { char nm[64] = "", cl[512] = ""; FILE* f = fopen("/dev/shm/tahoe-stacks", "r"); if (f) { if (fgets(nm, sizeof nm, f)) nm[strcspn(nm, "\n")] = 0; fclose(f); }
-			f = fopen("/proc/self/cmdline", "r"); if (f) { size_t n = fread(cl, 1, 511, f); for (size_t i = 0; i < n; i++) if (!cl[i]) cl[i] = ' '; fclose(f); }
-			want = nm[0] && strstr(cl, nm); }
+		int want = diag_target();
 		if (want && (!timeout_ns || syscall(SYS_gettid) == getpid())) { logf_("    ULW <%d:%ld> %p esperado=0x%x plazo=%lu op=0x%lx\n", (int)getpid(), (long)syscall(SYS_gettid), (void*)addr, expect, (unsigned long)timeout_ns, c->a[0]); { uint64_t m[8] = { 0 }; safe_read((uint64_t)addr - 24, m, 64); logf_("    ULW mem[-24..+40]: %lx %lx %lx %lx %lx %lx %lx %lx\n", m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]); } diag_crash(c->uc); }
 	}
 	if (trace_all) logf_("    ulock_wait(op=0x%lx, %p, esperado=0x%x, plazo=%luns)\n", c->a[0], (void*)addr, expect, (unsigned long)timeout_ns);
@@ -792,17 +935,17 @@ static long ulock_wait_impl(struct ctx* c, uint64_t timeout_ns) {
 		(void)once;
 		for (int i = 0; i < 256; i++) { long z = 0; if (__atomic_compare_exchange_n(&wait_tab[i].tid, &z, (long)syscall(SYS_gettid), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { wslot = i; wait_tab[i].addr = addr; wait_tab[i].expect = expect; wait_tab[i].op = c->a[0]; break; } }
 	}
-	_Atomic int* wc = &ulock_waiters[((uintptr_t)addr >> 2) & 1023];
-	atomic_fetch_add(wc, 1);
+	uwait_enter((uintptr_t)addr);
 	long r = syscall(SYS_futex, addr, FUTEX_WAIT_PRIVATE, expect, tp, NULL, 0);
-	int others = atomic_fetch_sub(wc, 1) - 1;
+	int e = errno;
+	int others = uwait_leave((uintptr_t)addr);
 	if (wslot >= 0) wait_tab[wslot].tid = 0;
-	if (r == 0) return others > 0 ? others : 0;
-	switch (errno) {
-	case EAGAIN: return 0;                       // el valor ya cambió: no hay que esperar
+	if (r == 0) return others;
+	switch (e) {
+	case EAGAIN: return others;                  // el valor ya cambió: no hay que esperar
 	case ETIMEDOUT: return -60;                  // ETIMEDOUT de Darwin
 	case EINTR: return -4;
-	default: return -darwin_errno(errno);
+	default: return -darwin_errno(e);
 	}
 }
 static long bsd_ulock_wait(struct ctx* c)  { return ulock_wait_impl(c, (uint64_t)(uint32_t)c->a[3] * 1000ULL); }   // plazo en microsegundos

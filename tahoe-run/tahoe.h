@@ -47,15 +47,25 @@ void emu_net_init(void);
 void emu_fs2_init(void);
 void emu_port_init(void);
 uint32_t port_create(int is_set);
+// Códigos de mach_msg (osfmk/mach/message.h). Con sufijo _ para no chocar con definiciones locales.
+#define MACH_SEND_INVALID_DATA_  0x10000002
+#define MACH_SEND_INVALID_DEST_  0x10000003
+#define MACH_RCV_INVALID_NAME_   0x10004002
+#define MACH_RCV_TIMED_OUT_      0x10004003
+#define MACH_RCV_TOO_LARGE__     0x10004004
+#define MACH_RCV_INVALID_DATA_   0x10004008
+#define MACH_RCV_PORT_DIED_      0x10004009
 int port_exists(uint32_t name);
 static inline int mach_trace(void) { static int v = -1; if (v < 0) v = access("/dev/shm/tahoe-mach-trace", F_OK) == 0; return v; }
 int port_rpid(uint32_t name);
 extern __thread int g_watch;
 int port_drain_idle(uint32_t name);
+int diag_target(void);
 int port_eventfd(uint32_t name);
 int port_send(uint32_t dest, const uint8_t* msg, uint32_t size);
 int port_receive(uint32_t name, int timeout_ms, uint8_t** out, uint32_t* size, uint32_t* sender, uint32_t limit, int large);
 void emu_sem_init(void);
+void emu_psynch_init(void);
 uint32_t sem_create(int value);
 uint32_t alloc_port(void);
 uint32_t tahoe_flags_fd(int fd);

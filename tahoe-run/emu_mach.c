@@ -345,7 +345,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 		(void)fit;
 		res = 0x10004004;
 	}
-	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = 0x10004003;
+	else if (safe_write(buf, m, size) != (ssize_t)size || safe_write(buf + size, tr, tsize) != (ssize_t)tsize) res = MACH_RCV_INVALID_DATA_;
 	else if (total) *total = size + tsize;
 	if (trace_all) logf_("    mach_msg: recibe en 0x%x id=%d (%u bytes) -> 0x%lx\n", rcv_name, h.id, size, res);
 	free(m);
@@ -497,7 +497,7 @@ static long mach_msg2(struct ctx* c) {
 		logf_("    mach_msg2: la respuesta (%zu+8) no cabe en rcv_size=%u (id=%d destino=0x%x)\n", n, rcvsize, h.id, h.remote);
 		return MACH_RCV_TOO_LARGE;
 	}
-	if (safe_write(rbuf, rep, n + 8) != (ssize_t)(n + 8)) return 0x10004003;   // MACH_RCV_INVALID_DATA
+	if (safe_write(rbuf, rep, n + 8) != (ssize_t)(n + 8)) return MACH_RCV_INVALID_DATA_;
 	return MACH_MSG_SUCCESS;
 }
 
