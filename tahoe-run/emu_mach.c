@@ -338,6 +338,7 @@ long mach_rx_message(uint32_t rcv_name, int timeout_ms, uint64_t options, uint64
 	if (tsize >= 12) memcpy(tr + 8, &seq, 4);
 	if (tsize >= 20) { memcpy(tr + 12, &uid, 4); memcpy(tr + 16, &gid, 4); }
 	if (tsize >= 52) memcpy(tr + 20, at, 32);
+	if (tsize >= 60) { uint64_t ctx = port_get_context(local); memcpy(tr + 52, &ctx, 8); }   // msgh_context: contexto del puerto receptor
 	long res = 0;
 	if (size + tsize > cap) {                                 // sin RCV_LARGE: se entrega truncado y se descarta el resto
 		uint32_t fit = cap > 24 ? cap - 24 : 0;
@@ -426,7 +427,24 @@ static long mach_msg2(struct ctx* c) {
 		uint64_t pol = 0; memcpy(rep + n, &pol, 8); n += 8;       // sin filtrado de mensajes: política 0
 		break;
 	}
-	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // task_policy_set / mach_port_set_attributes: sin efecto
+	case 3420: case 3218: n = reply_begin(rep, &h, KERN_SUCCESS_); break;
+	case 3230: {                                                  // mach_port_get_context(task, name) -> context
+		uint32_t nm; memcpy(&nm, req + 32, 4);
+		n = reply_begin(rep, &h, port_exists(nm) ? KERN_SUCCESS_ : 15 /* KERN_INVALID_NAME */);
+		uint64_t ctx = port_get_context(nm); memcpy(rep + n, &ctx, 8); n += 8;
+		break;
+	}
+	case 3235: {                                                  // mach_port_guard(task, name, guard, strict): la guarda es el contexto
+		uint32_t nm; uint64_t g; memcpy(&nm, req + 32, 4); memcpy(&g, req + 36, 8);
+		n = reply_begin(rep, &h, port_set_context(nm, g) ? KERN_SUCCESS_ : 15);
+		break;
+	}
+	case 3236: n = reply_begin(rep, &h, KERN_SUCCESS_); break;   // mach_port_unguard
+	case 3231: {                                                  // mach_port_set_context(task, name, context)
+		uint32_t nm; uint64_t ctx; memcpy(&nm, req + 32, 4); memcpy(&ctx, req + 36, 8);
+		n = reply_begin(rep, &h, port_set_context(nm, ctx) ? KERN_SUCCESS_ : 15);
+		break;
+	}   // task_policy_set / mach_port_set_attributes: sin efecto
 	case 4811: n = mig_mach_vm_map(&h, req, rep); break;
 	case 4817: n = mig_make_memory_entry(&h, req, rep); break;
 	case 4807: {                                                  // mach_vm_copy(task, src, size, dst): el destino ya está asignado

@@ -232,7 +232,7 @@ static long bsd_fstatfs64(struct ctx* c) {
 #define ATTR_VOL_INFO  0x80000000u
 #define ATTR_VOL_CAPABILITIES 0x00020000u
 #define ATTR_VOL_UUID  0x00040000u
-static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
+static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, uint32_t cmnext, const char* name, const char* fullpath, const struct stat* s, int pack_inval);
 static long bsd_getattrlist(struct ctx* c) {
 	char p[4096], b[4200];
 	uint32_t al[6] = { 0 };
@@ -252,21 +252,62 @@ static long bsd_getattrlist(struct ctx* c) {
 		const char* base = strrchr(gp2, '/');
 		base = base && base[1] ? base + 1 : gp2;
 		static uint8_t buf[8192];
-		size_t n = pack_entry(buf, common, al[3], al[4], base, gp2, &st, (c->a[4] & 8) != 0);
+		size_t n = pack_entry(buf, common, al[3], al[4], (c->a[4] & 0x20) ? al[5] : 0, base, gp2, &st, (c->a[4] & 8) != 0);
 		if (n > c->a[3]) { uint32_t tot = (uint32_t)n; safe_write(c->a[2], &tot, c->a[3] >= 4 ? 4 : 0); return 0; }
 		return safe_write(c->a[2], buf, n) == (ssize_t)n ? 0 : -D_EFAULT;
 	}
-	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_FULLPATH, known_v = ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES | ATTR_VOL_UUID;
+	// Atributos de volumen (con algunos comunes). Orden de sys/attr.h: longitud, returned_attrs (si se pidió), comunes y de
+	// volumen por orden de bit. Las cadenas van al final y se señalan con attrreference_t {desplazamiento desde la propia
+	// referencia, longitud con el NUL}. El volumen se presenta como el APFS de arranque montado en "/".
+	uint32_t known_c = ATTR_CMN_DEVID | ATTR_CMN_FSID | ATTR_CMN_FULLPATH | 0x80000000u /*RETURNED_ATTRS*/;
+	uint32_t known_v = 0xF0FFFFFFu;                               // ATTR_VOL_VALIDMASK
 	if ((common & ~known_c) || (vol & ~known_v) || al[3] || al[4] || al[5]) {
 		logf_("    getattrlist(\"%s\"): atributos sin implementar common=0x%x vol=0x%x dir=0x%x file=0x%x fork=0x%x\n", p, common, vol, al[3], al[4], al[5]);
 		return -45;                                       // ENOTSUP
 	}
-	if (stat(resolve(p, b, sizeof b), &s) != 0) return err();
-	uint8_t out[128];
+	const char* rpv = resolve(p, b, sizeof b);
+	if (stat(rpv, &s) != 0) return err();
+	struct statfs sf; if (statfs(rpv, &sf) != 0) memset(&sf, 0, sizeof sf);
+	uint8_t out[1024];
 	size_t n = 4;                                         // el primer campo es la longitud total
+	struct { size_t pos; const char* str; } refs[8]; int nrefs = 0;
 #define PUT(v, len) do { memcpy(out + n, (v), (len)); n += (len); } while (0)
+#define PUTU32(x) do { uint32_t _v = (uint32_t)(x); PUT(&_v, 4); } while (0)
+#define PUTU64(x) do { uint64_t _v = (uint64_t)(x); PUT(&_v, 8); } while (0)
+#define PUTREF(sv) do { refs[nrefs].pos = n; refs[nrefs++].str = (sv); n += 8; } while (0)
+	if (common & 0x80000000u) {                           // attribute_set_t: lo que se devuelve (todo lo pedido)
+		uint32_t rs[5] = { common, vol, 0, 0, 0 };
+		PUT(rs, 20);
+	}
+	char gpath[4096] = "";
 	if (common & ATTR_CMN_DEVID) { uint32_t d = (major(s.st_dev) << 24) | (minor(s.st_dev) & 0xffffff); PUT(&d, 4); }
 	if (common & ATTR_CMN_FSID) { uint32_t f2[2] = { (uint32_t)s.st_dev, 0x18 }; PUT(f2, 8); }
+	if (common & ATTR_CMN_FULLPATH) {                     // ruta absoluta tal como la ve macOS (sin la raíz del host)
+		char real[4096];
+		const char* rp = realpath(rpv, real) ? real : p;
+		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
+		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
+		snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
+		PUTREF(gpath);
+	}
+	uint64_t bs = sf.f_bsize ? (uint64_t)sf.f_bsize : 4096;
+	if (vol & 0x1) PUTU32(0x1c);                           // FSTYPE (número de vfs; apfs)
+	if (vol & 0x2) PUTU32(0x4244);                         // SIGNATURE
+	if (vol & 0x4) PUTU64(sf.f_blocks * bs);               // SIZE
+	if (vol & 0x8) PUTU64(sf.f_bfree * bs);                // SPACEFREE
+	if (vol & 0x10) PUTU64(sf.f_bavail * bs);              // SPACEAVAIL
+	if (vol & 0x20) PUTU64(bs);                            // MINALLOCATION
+	if (vol & 0x40) PUTU64(bs);                            // ALLOCATIONCLUMP
+	if (vol & 0x80) PUTU32(bs);                            // IOBLOCKSIZE
+	if (vol & 0x100) PUTU32(sf.f_files - sf.f_ffree);      // OBJCOUNT
+	if (vol & 0x200) PUTU32(sf.f_files - sf.f_ffree);      // FILECOUNT
+	if (vol & 0x400) PUTU32(0);                            // DIRCOUNT
+	if (vol & 0x800) PUTU32(sf.f_files);                   // MAXOBJCOUNT
+	if (vol & 0x1000) PUTREF("/");                         // MOUNTPOINT
+	if (vol & 0x2000) PUTREF("Macintosh HD");              // NAME
+	if (vol & 0x4000) PUTU32(0x1000 | 0x4000);             // MOUNTFLAGS: MNT_LOCAL | MNT_ROOTFS
+	if (vol & 0x8000) PUTREF("/dev/disk1s1");              // MOUNTEDDEVICE
+	if (vol & 0x10000) PUTU64(0);                          // ENCODINGSUSED
 	if (vol & ATTR_VOL_CAPABILITIES) {
 		// vol_capabilities_attr_t: capabilities[4] y valid[4] (formato, interfaces, reservados)
 		uint32_t caps[8] = {
@@ -281,30 +322,33 @@ static long bsd_getattrlist(struct ctx* c) {
 		static const uint8_t uuid[16] = { 0x74, 0x61, 0x68, 0x6f, 0x65, 0x2d, 0x72, 0x75, 0x6e, 0x2d, 0x72, 0x6f, 0x6f, 0x74, 0x00, 0x01 };
 		PUT(uuid, 16);
 	}
-#undef PUT
-	char gpath[4096] = "";
-	size_t refpos = 0;
-	if (common & ATTR_CMN_FULLPATH) {                       // ruta absoluta tal como la ve macOS (sin la raíz del host)
-		char real[4096];
-		const char* rp = realpath(resolve(p, b, sizeof b), real) ? real : p;
-		size_t rl = tahoe_root ? strlen(tahoe_root) : 0;
-		if (rl && !strncmp(rp, tahoe_root, rl) && (rp[rl] == '/' || rp[rl] == '\0')) rp += rl;
-		snprintf(gpath, sizeof gpath, "%s", rp[0] ? rp : "/");
-		refpos = n;
-		n += 8;                                              // attrreference_t, se rellena abajo
+	if (vol & 0x80000) PUTU32(0);                          // MOUNTEXTFLAGS
+	if (vol & 0x100000) PUTREF("apfs");                    // FSTYPENAME
+	if (vol & 0x200000) PUTU32(0);                         // FSSUBTYPE
+	if (vol & 0x400000) PUTU32(0);                         // OWNER (root)
+	if (vol & 0x800000) PUTU64((sf.f_blocks - sf.f_bfree) * bs);   // SPACEUSED
+	if (vol & 0x10000000) PUTU64(0);                       // QUOTA_SIZE
+	if (vol & 0x20000000) PUTU64(0);                       // RESERVED_SIZE
+	if (vol & 0x40000000) {                                // ATTRIBUTES: vol_attributes_attr_t (válidos y nativos)
+		uint32_t va[10] = { 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xF0FFFFFF, 0xffffffff, 0xffffffff, 0xffffffff };
+		PUT(va, 40);
 	}
-	if (common & ATTR_CMN_FULLPATH) {
-		uint32_t len = (uint32_t)strlen(gpath) + 1;
-		int32_t off = (int32_t)(n - refpos);                 // distancia desde la referencia hasta la cadena
-		memcpy(out + refpos, &off, 4);
-		memcpy(out + refpos + 4, &len, 4);
-		if (n + len > sizeof out) return -D_ENOMEM;
-		memcpy(out + n, gpath, len);
+	for (int i = 0; i < nrefs; i++) {                       // cadenas al final
+		uint32_t len = (uint32_t)strlen(refs[i].str) + 1;
+		if (n + len + 4 > sizeof out) return -D_ENOMEM;
+		int32_t off = (int32_t)(n - refs[i].pos);
+		memcpy(out + refs[i].pos, &off, 4);
+		memcpy(out + refs[i].pos + 4, &len, 4);
+		memcpy(out + n, refs[i].str, len);
 		n += (len + 3) & ~3u;
 	}
+#undef PUT
+#undef PUTU32
+#undef PUTU64
+#undef PUTREF
 	uint32_t total = (uint32_t)n;
 	memcpy(out, &total, 4);
-	if (n > c->a[3]) return -D_ENOMEM;
+	if (n > c->a[3]) { safe_write(c->a[2], &total, c->a[3] >= 4 ? 4 : 0); return 0; }   // no cabe: solo la longitud
 	return safe_write(c->a[2], out, n) == (ssize_t)n ? 0 : -D_EFAULT;
 }
 
@@ -408,7 +452,8 @@ static uint32_t vtype_of(mode_t m) {                       // fsobj_type_t
 #define A_DIR_LINKCOUNT 0x1u
 #define A_DIR_ENTRYCOUNT 0x2u
 #define A_DIR_MOUNTSTATUS 0x4u
-static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, const char* name, const char* fullpath, const struct stat* s, int pack_inval) {
+// cmnext: atributos comunes extendidos (FSOPT_ATTR_CMN_EXTENDED: viajan en el campo forkattr), después de los de archivo.
+static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t file, uint32_t cmnext, const char* name, const char* fullpath, const struct stat* s, int pack_inval) {
 	size_t n = 4;                                            // longitud total, se rellena al final
 	size_t ret_at = n;
 	if (common & A_CMN_RETURNED) n += 20;                    // attribute_set_t returned_attrs
@@ -467,6 +512,19 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 	if (file & 0x400u) { P64(isdir ? 0 : (uint64_t)s->st_blocks * 512); if (!isdir) rf |= 0x400u; }   // DATAALLOCSIZE
 	if (file & 0x1000u) { P64(0); if (!isdir) rf |= 0x1000u; }                                         // RSRCLENGTH
 	if (file & 0x2000u) { P64(0); if (!isdir) rf |= 0x2000u; }                                         // RSRCALLOCSIZE
+	uint32_t rx = 0;
+	size_t relpath_ref = 0, nofirm_ref = 0;
+	if (cmnext & 0x4) { relpath_ref = n; n += 8; rx |= 0x4; }                          // RELPATH
+	if (cmnext & 0x8) { P64(0); rx |= 0x8; }                                             // PRIVATESIZE
+	if (cmnext & 0x10) { P64(s->st_ino); rx |= 0x10; }                                   // LINKID
+	if (cmnext & 0x20) { nofirm_ref = n; n += 8; rx |= 0x20; }                         // NOFIRMLINKPATH
+	if (cmnext & 0x40) { P32((major(s->st_dev) << 24) | (minor(s->st_dev) & 0xffffff)); rx |= 0x40; }   // REALDEVID
+	if (cmnext & 0x80) { P32((uint32_t)s->st_dev); P32(0x18); rx |= 0x80; }             // REALFSID
+	if (cmnext & 0x100) { P64(s->st_ino); rx |= 0x100; }                                 // CLONEID
+	if (cmnext & 0x200) { P64(0); rx |= 0x200; }                                         // EXT_FLAGS
+	if (cmnext & 0x400) { P64(0); rx |= 0x400; }                                         // RECURSIVE_GENCOUNT
+	if (cmnext & 0x800) { P64(0); rx |= 0x800; }                                         // ATTRIBUTION_TAG
+	if (cmnext & 0x1000) { P32(1); rx |= 0x1000; }                                       // CLONE_REFCNT
 	(void)pack_inval;
 	// cadenas de longitud variable al final, en el orden de sus referencias
 	if (common & A_CMN_NAME) {
@@ -487,8 +545,20 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 		memcpy(o + n, fullpath, pl);
 		n += (pl + 3) & ~3UL;
 	}
+	const char* rel_or_path[2] = { fullpath, fullpath };
+	size_t refs2[2] = { relpath_ref, nofirm_ref };
+	for (int i = 0; i < 2; i++) {
+		if (!refs2[i]) continue;
+		size_t pl = strlen(rel_or_path[i]) + 1;
+		int32_t off = (int32_t)(n - refs2[i]);
+		uint32_t len = (uint32_t)pl;
+		memcpy(o + refs2[i], &off, 4);
+		memcpy(o + refs2[i] + 4, &len, 4);
+		memcpy(o + n, rel_or_path[i], pl);
+		n += (pl + 3) & ~3UL;
+	}
 	if (common & A_CMN_RETURNED) {
-		uint32_t ret[5] = { rc | A_CMN_RETURNED, 0, rd, rf, 0 };     // commonattr, volattr, dirattr, fileattr, forkattr
+		uint32_t ret[5] = { rc | A_CMN_RETURNED, 0, rd, rf, rx };    // commonattr, volattr, dirattr, fileattr, forkattr (cmnext)
 		memcpy(o + ret_at, ret, 20);
 	}
 	uint32_t total = (uint32_t)n;
@@ -500,7 +570,7 @@ static size_t pack_entry(uint8_t* o, uint32_t common, uint32_t dir, uint32_t fil
 }
 static uint32_t dir_attrs_g;                              // dirattr de la petición en curso (getattrlistbulk)
 static size_t pack_bulk_entry(uint8_t* o, uint32_t common, uint32_t file, const char* name, const struct stat* s) {
-	return pack_entry(o, common, dir_attrs_g, file, name, "", s, 1);
+	return pack_entry(o, common, dir_attrs_g, file, 0, name, "", s, 1);
 }
 
 // getattrlistbulk(fd, attrlist*, búfer, tamaño, opciones): devuelve cuántas entradas empaquetó (0 = fin).

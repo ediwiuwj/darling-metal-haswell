@@ -33,7 +33,7 @@
 #define MAXPORTS 2048
 #define MAXMSG   512
 #define MSGSZ    (64 * 1024)
-struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set; pthread_cond_t cv; };   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
+struct sport { uint32_t name, set, head, tail, count; int32_t owner, rpid; uint8_t used, is_set; pthread_cond_t cv; uint64_t ctx; };   // ctx: contexto del puerto (mach_port_construct / set_context), va en el trailer   // cv: despierta solo a quien espera este puerto/conjunto   // rpid: proceso que recibe ahora (cambia al mover el derecho de recepción)
 struct mslot { uint32_t next, size, total, spid, suid, sgid; uint8_t data[MSGSZ - 24]; };
 struct shm {
 	pthread_mutex_t lk; pthread_cond_t cv;
@@ -379,6 +379,7 @@ static long t_construct(struct ctx* c) {
 	uint32_t flags = 0;
 	if (c->a[1]) safe_read(c->a[1], &flags, 4);
 	uint32_t n = port_create(0);                     // construct nunca crea conjuntos (el bit 8 es MPO_IMPORTANCE_RECEIVER)
+	if (n != (uint32_t)-1) port_set_context(n, c->a[2]);   // el contexto (o la guarda, con MPO_CONTEXT_AS_GUARD) del puerto
 	if (trace_all) { uint32_t opt[6] = { 0 }; if (c->a[1]) safe_read(c->a[1], opt, 24); logf_("    construct 0x%x: flags=0x%x qlimit=%u opt2=0x%x opt3=0x%x contexto=0x%lx\n", n, opt[0], opt[1], opt[2], opt[3], c->a[2]); }
 	return safe_write(c->a[3], &n, 4) == 4 ? KERN_OK : KERN_INVALID_VALUE_;
 }
@@ -393,6 +394,8 @@ int port_drain_idle(uint32_t name) {
 	if (!cnt) drain_all(fd);
 	return gone;
 }
+uint64_t port_get_context(uint32_t name) { lock(); struct sport* p = find_locked(name); uint64_t r = p ? p->ctx : 0; unlock(); return r; }
+int port_set_context(uint32_t name, uint64_t v) { lock(); struct sport* p = find_locked(name); if (p) p->ctx = v; unlock(); return p != NULL; }
 int port_rpid(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p ? p->rpid : -1; unlock(); return r; }
 static int owns(uint32_t name) { lock(); struct sport* p = find_locked(name); int r = p && p->owner == (int32_t)getpid(); unlock(); return r; }
 void port_move_receive(uint32_t name) { lock(); struct sport* p = find_locked(name); if (p) p->owner = (int32_t)getpid(); unlock(); }

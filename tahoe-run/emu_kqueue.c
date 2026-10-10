@@ -175,6 +175,66 @@ static void knote_set_enabled(struct knote* n, int en) {
 	sync_fd(n->kq, n->fd);
 }
 
+// ---- EVFILT_WORKLOOP: espera síncrona (dispatch_sync sobre colas con workloop), como filt_wl* de XNU.
+// Knote por (workloop, ident = tid del que espera). NOTE_WL_SYNC_WAIT bloquea hasta que otro hilo lo toca con
+// NOTE_WL_SYNC_WAKE (o lo borra); un WAKE que llega antes queda anotado y la espera vuelve en seguida. Con dirección de
+// rebote (ext[1]) se compara (*ext[1] & ext[2]) con ext[3]: si no coincide, ESTALE (o nada con NOTE_WL_IGNORE_ESTALE).
+#define NOTE_WL_THREAD_REQUEST 0x1u
+#define NOTE_WL_SYNC_WAIT      0x4u
+#define NOTE_WL_SYNC_WAKE      0x8u
+#define NOTE_WL_COMMANDS_MASK  0x8000000fu
+#define NOTE_WL_UPDATES_MASK   0x000001f0u
+#define NOTE_WL_IGNORE_ESTALE  0x100u
+#define D_ESTALE 70
+struct wlsync { int kq; uint64_t ident; uint32_t sfflags; int waiting, dead; struct wlsync* next; };
+static struct wlsync* wlsyncs;
+static pthread_mutex_t wls_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t wls_cv = PTHREAD_COND_INITIALIZER;
+// Comprobación de rebote: 0 si no hay dirección o coincide; D_ESTALE si cambió (ext[3] se actualiza con el valor leído).
+static int wl_debounce(struct kev* c) {
+	if (!c->ext[1]) return 0;
+	uint64_t v = 0;
+	if (safe_read(c->ext[1], &v, 8) != 8) return D_EFAULT;
+	uint64_t want = c->ext[3];
+	c->ext[3] = v;
+	return ((v & c->ext[2]) != (want & c->ext[2])) ? D_ESTALE : 0;
+}
+static int wl_sync_change(int kq, struct kev* c) {
+	pthread_mutex_lock(&wls_lock);
+	struct wlsync** pp = &wlsyncs;
+	while (*pp && !((*pp)->kq == kq && (*pp)->ident == c->ident && !(*pp)->dead)) pp = &(*pp)->next;
+	struct wlsync* w = *pp;
+	int e = wl_debounce(c);
+	if (e == D_ESTALE && (c->fflags & NOTE_WL_IGNORE_ESTALE)) { pthread_mutex_unlock(&wls_lock); return 0; }
+	if (e) { pthread_mutex_unlock(&wls_lock); return e; }
+	if (c->flags & EV_DELETE) {
+		if (!w) { pthread_mutex_unlock(&wls_lock); return D_ENOENT; }
+		*pp = w->next;                                      // fuera de la lista; si alguien espera, se libera al despertar
+		w->dead = 1; w->sfflags |= NOTE_WL_SYNC_WAKE;
+		pthread_cond_broadcast(&wls_cv);
+		if (!w->waiting) free(w);
+		pthread_mutex_unlock(&wls_lock);
+		return 0;
+	}
+	if (!w) {
+		w = calloc(1, sizeof *w);
+		if (!w) { pthread_mutex_unlock(&wls_lock); return D_ENOMEM; }
+		w->kq = kq; w->ident = c->ident; w->sfflags = c->fflags;
+		w->next = wlsyncs; wlsyncs = w;
+	} else {
+		w->sfflags = (w->sfflags & ~NOTE_WL_UPDATES_MASK) | c->fflags;
+	}
+	if (c->fflags & NOTE_WL_SYNC_WAKE) pthread_cond_broadcast(&wls_cv);
+	if ((c->fflags & NOTE_WL_COMMANDS_MASK) == NOTE_WL_SYNC_WAIT) {
+		w->waiting++;
+		while (!(w->sfflags & NOTE_WL_SYNC_WAKE) && !w->dead) pthread_cond_wait(&wls_cv, &wls_lock);
+		w->waiting--;
+		if (w->dead && !w->waiting) free(w);
+	}
+	pthread_mutex_unlock(&wls_lock);
+	return 0;
+}
+
 // Aplica un cambio; devuelve 0 o un errno de Darwin.
 static int apply(int kq, const struct kev* c) {
 	if ((trace_all || mach_trace()) && c->filter == EVFILT_MACHPORT) logf_("    kevent: <%d> cambio MACHPORT 0x%lx flags=0x%x fflags=0x%x kq=%d\n", (int)getpid(), c->ident, c->flags, c->fflags, kq);
@@ -234,7 +294,12 @@ static int apply(int kq, const struct kev* c) {
 			break;
 		}
 		case EVFILT_WORKLOOP:
-			if (c->fflags & 1 /*NOTE_WL_THREAD_REQUEST*/) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
+			if (c->fflags & NOTE_WL_THREAD_REQUEST) {
+				struct kev cc = *c;
+				int de = wl_debounce(&cc);
+				if (de) { n->fd = -1; drop(n); if (de == D_ESTALE && (c->fflags & NOTE_WL_IGNORE_ESTALE)) return 0; ((struct kev*)c)->ext[3] = cc.ext[3]; return de; }
+				uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r);
+			}
 			break;
 		default:
 			logf_("    kevent: filtro %d (ident=0x%lx flags=0x%x fflags=0x%x data=%ld ext=%lx,%lx,%lx,%lx) registrado sin efecto\n", c->filter, c->ident, c->flags, c->fflags, (long)c->data, c->ext[0], c->ext[1], c->ext[2], c->ext[3]);
@@ -261,7 +326,12 @@ static int apply(int kq, const struct kev* c) {
 			}
 			if (!(c->flags & EV_DISABLE)) knote_set_enabled(n, 1);   // EV_ADD implica activar salvo EV_DISABLE
 		}
-		if (c->filter == EVFILT_WORKLOOP && (c->fflags & 1)) { uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r); }
+		if (c->filter == EVFILT_WORKLOOP && (c->fflags & NOTE_WL_THREAD_REQUEST) && !(c->flags & EV_DELETE)) {
+			struct kev cc = *c;
+			int de = wl_debounce(&cc);
+			if (de) { if (de == D_ESTALE && (c->fflags & NOTE_WL_IGNORE_ESTALE)) return 0; ((struct kev*)c)->ext[3] = cc.ext[3]; return de; }
+			uint8_t r[72]; kev_out(2, r, c); wq_request_workloop(c->ident, r);
+		}
 	}
 	if (c->flags & EV_DISABLE) knote_set_enabled(n, 0);
 	if (c->flags & EV_ENABLE) knote_set_enabled(n, 1);
@@ -301,9 +371,13 @@ static long do_kevent(int guest_kq, int layout, uint64_t chg, long nchg, uint64_
 		struct kev k;
 		if (safe_read(chg + i * kev_size[layout], raw, kev_size[layout]) != (ssize_t)kev_size[layout]) return -D_EFAULT;
 		kev_in(layout, raw, &k);
-		pthread_mutex_lock(&kq_lock);
-		int e = apply(kq, &k);
-		pthread_mutex_unlock(&kq_lock);
+		int e;
+		if (k.filter == EVFILT_WORKLOOP && (k.fflags & (NOTE_WL_SYNC_WAIT | NOTE_WL_SYNC_WAKE))) e = wl_sync_change(kq, &k);   // puede bloquear: sin kq_lock
+		else {
+			pthread_mutex_lock(&kq_lock);
+			e = apply(kq, &k);
+			pthread_mutex_unlock(&kq_lock);
+		}
 		if (e || (k.flags & EV_RECEIPT)) {
 			if (nout < nev) {
 				k.flags |= EV_ERROR; k.data = e;
